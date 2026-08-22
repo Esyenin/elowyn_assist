@@ -6,7 +6,12 @@ from elowyn.memory.deep import (
     ExactSourceContextMessage,
     ExactSourceView,
 )
-from elowyn.memory.hindsight import HindsightAdapter, HindsightConfig
+from elowyn.memory.generation import ActiveGenerationMemoryService, MemoryBackendFactory
+from elowyn.memory.hindsight import (
+    HindsightAdapter,
+    HindsightBackendFactory,
+    HindsightConfig,
+)
 from elowyn.memory.observations import (
     MemoryPageEntry,
     MemoryPageView,
@@ -15,6 +20,7 @@ from elowyn.memory.observations import (
     ObservationEvidenceView,
     ObservationView,
 )
+from elowyn.memory.rebuild import MemoryDiagnostics, MemoryRebuildError, MemoryRebuildResult
 from elowyn.memory.service import (
     EpistemicStatus,
     MemoryProvenance,
@@ -24,6 +30,7 @@ from elowyn.memory.service import (
 )
 
 __all__ = [
+    "ActiveGenerationMemoryService",
     "DeepMemoryRoute",
     "DeepRecallItem",
     "DeepRecallView",
@@ -32,10 +39,15 @@ __all__ = [
     "ExactSourceContextMessage",
     "ExactSourceView",
     "HindsightAdapter",
+    "HindsightBackendFactory",
     "HindsightConfig",
     "MemoryProvenance",
+    "MemoryBackendFactory",
+    "MemoryDiagnostics",
     "MemoryPageEntry",
     "MemoryPageView",
+    "MemoryRebuildError",
+    "MemoryRebuildResult",
     "MemorySemantics",
     "MemoryService",
     "ObservationCandidate",

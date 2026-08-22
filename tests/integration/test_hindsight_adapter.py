@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import os
 import uuid
 from datetime import UTC, datetime
@@ -9,8 +8,7 @@ import pytest
 
 from elowyn.memory.hindsight import (
     METADATA_SCHEMA_VERSION,
-    HindsightAdapter,
-    HindsightConfig,
+    HindsightBackendFactory,
     document_id_for,
 )
 from elowyn.memory.service import (
@@ -30,13 +28,12 @@ async def test_real_hindsight_091_retain_retry_recall_reflect() -> None:
     base_url = os.getenv("ELOWYN_TEST_HINDSIGHT_URL")
     if not base_url:
         pytest.skip("ELOWYN_TEST_HINDSIGHT_URL is not configured")
-    module = importlib.import_module("hindsight_client")
-    client = module.Hindsight(base_url=base_url, timeout=120.0)
     bank_id = f"elowyn-adapter-{uuid.uuid4()}"
-    await client.acreate_bank(bank_id, name="Elowyn synthetic adapter test")
-    adapter = HindsightAdapter(
-        HindsightConfig(base_url=base_url, bank_id=bank_id, timeout_seconds=120.0),
-        client=client,
+    adapter = await HindsightBackendFactory(
+        base_url=base_url,
+        timeout_seconds=120.0,
+    ).create_clean(
+        bank_id,
     )
     conversation_id = uuid.uuid4()
     message = RetainMessage(

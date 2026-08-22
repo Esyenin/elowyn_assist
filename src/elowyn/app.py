@@ -30,7 +30,8 @@ async def main() -> None:
     from aiogram import Bot, Dispatcher
 
     from elowyn.db.session import SessionFactory
-    from elowyn.memory.hindsight import BACKEND_NAME, HindsightAdapter, HindsightConfig
+    from elowyn.memory.generation import ActiveGenerationMemoryService
+    from elowyn.memory.hindsight import BACKEND_NAME, HindsightBackendFactory
     from elowyn.provider import build_runtime_model
     from elowyn.runtime import ElowynRuntime
     from elowyn.services.memory_pipeline import (
@@ -38,6 +39,7 @@ async def main() -> None:
         MemoryIngestionWorker,
         MemoryPipelineConfig,
     )
+    from elowyn.services.memory_rebuild import MemoryGenerationManager, MemoryRebuildConfig
     from elowyn.transport.telegram import TelegramAdapter, build_router
 
     token = _required_env("TELEGRAM_BOT_TOKEN")
@@ -52,17 +54,23 @@ async def main() -> None:
     memory_task = None
     if memory_url:
         bank_id = _required_env("HINDSIGHT_BANK_ID")
-        memory = HindsightAdapter(
-            HindsightConfig(
-                base_url=memory_url,
-                bank_id=bank_id,
-                api_key=os.environ.get("HINDSIGHT_API_KEY") or None,
-            )
+        factory = HindsightBackendFactory(
+            base_url=memory_url,
+            api_key=os.environ.get("HINDSIGHT_API_KEY") or None,
         )
         bank_generation = hashlib.sha256(bank_id.encode("utf-8")).hexdigest()[:16]
-        pipeline_config = MemoryPipelineConfig(
-            backend=f"{BACKEND_NAME}:{bank_generation}"
+        pipeline_backend = f"{BACKEND_NAME}:{bank_generation}"
+        await MemoryGenerationManager(
+            SessionFactory,
+            factory,
+            MemoryRebuildConfig(backend=pipeline_backend, bank_prefix=bank_id),
+        ).bootstrap_existing(bank_id)
+        memory = ActiveGenerationMemoryService(
+            SessionFactory,
+            backend=pipeline_backend,
+            factory=factory,
         )
+        pipeline_config = MemoryPipelineConfig(backend=pipeline_backend)
         memory_worker = MemoryIngestionWorker(
             MemoryIngestionProcessor(SessionFactory, memory, pipeline_config)
         )

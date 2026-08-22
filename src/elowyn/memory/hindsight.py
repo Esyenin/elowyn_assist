@@ -221,6 +221,40 @@ class HindsightAdapter:
         raise MemoryBackendError("Hindsight retain operation timed out")
 
 
+@dataclass(frozen=True)
+class HindsightBackendFactory:
+    """Open isolated pinned adapters and explicitly create clean rebuild banks."""
+
+    base_url: str
+    api_key: str | None = None
+    timeout_seconds: float = 300.0
+
+    def open(self, bank_id: str) -> HindsightAdapter:
+        return HindsightAdapter(
+            HindsightConfig(
+                base_url=self.base_url,
+                bank_id=bank_id,
+                api_key=self.api_key,
+                timeout_seconds=self.timeout_seconds,
+            )
+        )
+
+    async def create_clean(self, bank_id: str) -> HindsightAdapter:
+        adapter = self.open(bank_id)
+        try:
+            await adapter._client.acreate_bank(
+                bank_id,
+                name=f"Elowyn rebuild generation {bank_id[-12:]}",
+            )
+        except asyncio.CancelledError:
+            await adapter.close()
+            raise
+        except Exception as exc:
+            await adapter.close()
+            raise MemoryBackendError("Hindsight clean bank creation failed") from exc
+        return adapter
+
+
 def document_id_for(conversation_id: uuid.UUID) -> str:
     return f"elowyn:conversation:{conversation_id}"
 

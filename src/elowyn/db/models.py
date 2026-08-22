@@ -29,6 +29,7 @@ from elowyn.domain.enums import (
     EventType,
     EvidenceStance,
     GoalStatus,
+    MemoryGenerationStatus,
     MemoryIngestionStatus,
     MemoryPageType,
     MessageAuthor,
@@ -211,6 +212,71 @@ class MemoryIngestionReceipt(Base):
     )
     succeeded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryGeneration(Base):
+    """Journal for disposable backend generations built from the raw archive."""
+
+    __tablename__ = "memory_generations"
+    __table_args__ = (
+        UniqueConstraint("bank_id", name="uq_memory_generation_bank"),
+        CheckConstraint("length(trim(backend)) > 0", name="ck_memory_generation_backend"),
+        CheckConstraint("length(trim(bank_id)) > 0", name="ck_memory_generation_bank"),
+        CheckConstraint("messages_total >= 0", name="ck_memory_generation_total"),
+        CheckConstraint("messages_replayed >= 0", name="ck_memory_generation_replayed"),
+        CheckConstraint("messages_verified >= 0", name="ck_memory_generation_verified"),
+        CheckConstraint(
+            "messages_replayed <= messages_total",
+            name="ck_memory_generation_progress",
+        ),
+        CheckConstraint(
+            "(status = 'BUILDING' AND lease_expires_at IS NOT NULL) OR "
+            "(status <> 'BUILDING' AND lease_expires_at IS NULL)",
+            name="ck_memory_generation_lease",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    backend: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    bank_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[MemoryGenerationStatus] = mapped_column(
+        enum_type(MemoryGenerationStatus, name="memory_generation_status"),
+        nullable=False,
+        index=True,
+    )
+    messages_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    messages_replayed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    messages_verified: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryBackendRegistry(Base):
+    """Single atomic pointer to the active backend generation."""
+
+    __tablename__ = "memory_backend_registries"
+    __table_args__ = (
+        CheckConstraint("length(trim(backend)) > 0", name="ck_memory_registry_backend"),
+    )
+
+    backend: Mapped[str] = mapped_column(String(100), primary_key=True)
+    active_generation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memory_generations.id", ondelete="RESTRICT"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
 

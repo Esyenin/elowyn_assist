@@ -77,6 +77,13 @@ class MemoryIngestionStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class MemoryGenerationStatus(StrEnum):
+    BUILDING = "BUILDING"
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"
+    FAILED = "FAILED"
+
+
 class SemanticCategory(StrEnum):
     FACT = "FACT"
     PREFERENCE = "PREFERENCE"
