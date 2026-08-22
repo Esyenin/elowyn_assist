@@ -126,6 +126,7 @@ def main() -> int:
                 "hindsight",
                 "-q",
                 "-ra",
+                "--tb=short",
             ],
             env=test_environment,
             check=False,
