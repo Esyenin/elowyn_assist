@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -26,11 +27,15 @@ from elowyn.domain.enums import (
     DecisionStatus,
     EntityType,
     EventType,
+    EvidenceStance,
     GoalStatus,
     MemoryIngestionStatus,
+    MemoryPageType,
     MessageAuthor,
+    ObservationStatus,
     ProjectStatus,
     RelationType,
+    SemanticCategory,
     SourceType,
     SuccessCriterionStatus,
     TaskStatus,
@@ -206,6 +211,111 @@ class MemoryIngestionReceipt(Base):
     )
     succeeded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryObservation(Base):
+    """Elowyn-owned, evidence-backed derived belief; never canonical state."""
+
+    __tablename__ = "memory_observations"
+    __table_args__ = (
+        CheckConstraint("length(trim(claim_key)) > 0", name="ck_observation_claim_key"),
+        CheckConstraint("length(trim(statement)) > 0", name="ck_observation_statement"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_observation_confidence"),
+        CheckConstraint(
+            "superseded_by_id IS NULL OR superseded_by_id <> id",
+            name="ck_observation_not_superseded_by_self",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    claim_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[SemanticCategory] = mapped_column(
+        enum_type(SemanticCategory, name="memory_semantic_category"), nullable=False
+    )
+    status: Mapped[ObservationStatus] = mapped_column(
+        enum_type(ObservationStatus, name="memory_observation_status"),
+        nullable=False,
+        index=True,
+    )
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    page_type: Mapped[MemoryPageType] = mapped_column(
+        enum_type(MemoryPageType, name="memory_page_type"), nullable=False, index=True
+    )
+    page_scope_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memory_observations.id", ondelete="SET NULL"), nullable=True
+    )
+    derivation_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryObservationEvidence(Base):
+    """Distinct atomic-memory evidence linked back to one canonical Message."""
+
+    __tablename__ = "memory_observation_evidence"
+    __table_args__ = (
+        CheckConstraint("length(trim(backend_memory_id)) > 0", name="ck_evidence_backend_id"),
+        CheckConstraint("length(trim(assertion_text)) > 0", name="ck_evidence_assertion"),
+    )
+
+    observation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_observations.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    backend_memory_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    stance: Mapped[EvidenceStance] = mapped_column(
+        enum_type(EvidenceStance, name="memory_evidence_stance"), nullable=False
+    )
+    assertion_text: Mapped[str] = mapped_column(Text, nullable=False)
+    explicit_correction: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryPage(Base):
+    """Compact, independently refreshable navigation shortcut over observations."""
+
+    __tablename__ = "memory_pages"
+    __table_args__ = (
+        UniqueConstraint("page_type", "scope_key", name="uq_memory_page_scope"),
+        CheckConstraint("length(trim(scope_key)) > 0", name="ck_memory_page_scope"),
+        CheckConstraint("length(trim(title)) > 0", name="ck_memory_page_title"),
+        CheckConstraint("max_entries > 0 AND max_entries <= 12", name="ck_memory_page_limit"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    page_type: Mapped[MemoryPageType] = mapped_column(
+        enum_type(MemoryPageType, name="memory_page_type"), nullable=False, index=True
+    )
+    scope_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    entries: Mapped[list[dict[str, Any]]] = mapped_column(JSON_DATA, default=list, nullable=False)
+    max_entries: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
+    derivation_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryPageObservation(Base):
+    __tablename__ = "memory_page_observations"
+
+    page_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_pages.id", ondelete="CASCADE"), primary_key=True
+    )
+    observation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_observations.id", ondelete="CASCADE"), primary_key=True
     )
 
 

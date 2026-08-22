@@ -6,18 +6,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
 
+from elowyn.domain.enums import SemanticCategory
+
 MemoryKind = Literal["world", "experience", "observation"]
 TagMatch = Literal["any", "all", "any_strict", "all_strict", "exact"]
-
-
-class SemanticCategory(StrEnum):
-    FACT = "FACT"
-    PREFERENCE = "PREFERENCE"
-    CONTEXT = "CONTEXT"
-    IDEA = "IDEA"
-    EPISODE = "EPISODE"
-    CONSTRAINT = "CONSTRAINT"
-    OBSERVATION = "OBSERVATION"
 
 
 class EpistemicStatus(StrEnum):

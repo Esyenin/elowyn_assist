@@ -77,6 +77,35 @@ class MemoryIngestionStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class SemanticCategory(StrEnum):
+    FACT = "FACT"
+    PREFERENCE = "PREFERENCE"
+    CONTEXT = "CONTEXT"
+    IDEA = "IDEA"
+    EPISODE = "EPISODE"
+    CONSTRAINT = "CONSTRAINT"
+    OBSERVATION = "OBSERVATION"
+
+
+class ObservationStatus(StrEnum):
+    CANDIDATE = "CANDIDATE"
+    ACTIVE = "ACTIVE"
+    CONTESTED = "CONTESTED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class EvidenceStance(StrEnum):
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+
+
+class MemoryPageType(StrEnum):
+    USER_PROFILE = "USER_PROFILE"
+    COMMUNICATION_PREFERENCES = "COMMUNICATION_PREFERENCES"
+    PROJECT = "PROJECT"
+    TOPIC = "TOPIC"
+
+
 class SourceType(StrEnum):
     USER_MESSAGE = "USER_MESSAGE"
     ASSISTANT_INFERENCE = "ASSISTANT_INFERENCE"

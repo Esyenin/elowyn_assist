@@ -27,6 +27,10 @@ EXPECTED_TABLES = {
     "conversation_summaries",
     "memory_ingestion_states",
     "memory_ingestion_receipts",
+    "memory_observations",
+    "memory_observation_evidence",
+    "memory_pages",
+    "memory_page_observations",
 }
 
 
