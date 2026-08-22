@@ -1,0 +1,3 @@
+# Slice 1 feasibility-only client pin. The Hindsight server is deployed separately
+# as ghcr.io/vectorize-io/hindsight:0.9.1; it is not a Core runtime dependency.
+hindsight-client==0.9.1
