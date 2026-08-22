@@ -78,9 +78,10 @@ class _PromptModel:
 
 
 class _ExactSourceModel:
-    def __init__(self, source_ref: str, raw_text: str) -> None:
+    def __init__(self, source_ref: str, raw_text: str, recall_query: str) -> None:
         self.source_ref = source_ref
         self.raw_text = raw_text
+        self.recall_query = recall_query
         self.calls = 0
         self.tools: set[str] = set()
         self.model = FunctionModel(self._respond)
@@ -93,7 +94,7 @@ class _ExactSourceModel:
                 parts=[
                     ToolCallPart(
                         tool_name="recall_long_term_memory",
-                        args={"query": self.raw_text},
+                        args={"query": self.recall_query},
                     )
                 ]
             )
@@ -212,7 +213,8 @@ async def _isolated_source_service(factory, message: Message):
         text=message.text or "",
     )
     await isolated.retain((retained,))
-    return isolated
+    recalled = await _wait_for_message(isolated, message.id, message.text or "")
+    return isolated, recalled.text
 
 
 def _restart_hindsight(container_name: str, base_url: str) -> None:
@@ -489,8 +491,12 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
         accepted.add(12)
 
         exact_message = by_text[exact_raw]
-        exact_memory = await _isolated_source_service(factory, exact_message)
-        exact_model = _ExactSourceModel(exact_message_source_ref(exact_message), exact_raw)
+        exact_memory, exact_recall_query = await _isolated_source_service(factory, exact_message)
+        exact_model = _ExactSourceModel(
+            exact_message_source_ref(exact_message),
+            exact_raw,
+            exact_recall_query,
+        )
         exact_runtime = ElowynRuntime(
             session_factory=session_factory,
             model=exact_model.model,
