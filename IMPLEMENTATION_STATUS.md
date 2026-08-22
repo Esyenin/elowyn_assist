@@ -3,10 +3,10 @@
 ## Текущий статус
 
 Функциональный contract v0.1 и DB safety phases 1–6 подтверждены локально на реальном PostgreSQL.
-Локальный deterministic E2E проходит через `TelegramAdapter → Pydantic AI FunctionModel → Core →`
-least-privilege runtime role → PostgreSQL. Этап в целом **ещё не объявлен полностью успешным**:
-внешний Telegram/provider E2E не запускался из-за отсутствия provider API key, Telegram token и
-allowed user id; исправленный удалённый GitHub Actions run также появится только после commit/push.
+Deterministic E2E и реальный hosted-provider vertical подтверждены: `Telegram Bot API/polling →
+TelegramAdapter → Pydantic AI → NVIDIA Nemotron → domain tools → least-privilege runtime role →
+PostgreSQL → Telegram response`. Функциональных runtime gates до release v0.1.0 не осталось;
+merge feature-ветки и release tag выполняются только отдельными командами.
 
 ## Реализовано
 
@@ -62,6 +62,10 @@ allowed user id; исправленный удалённый GitHub Actions run 
 - Recovery database защищена test-name/env/server checks и постоянным sentinel comment; runtime и
   owner роли очищаются от memberships, имеют `NOINHERIT`/`NOBYPASSRLS`, runtime лишён `TEMP`.
 - CI получает полную Git history и принудительно падает при любом pytest skip/xfail/xpass.
+- Runtime-only NVIDIA provider использует OpenAI-compatible hosted endpoint; model/key остаются
+  конфигурацией окружения и не протекают в Core.
+- Локальная обычная `elowyn_dev` DB имеет отдельные migration owner/application runtime роли;
+  Telegram entrypoint загружает `.env` до создания DB engine/provider resources.
 
 ## Исправленные проблемы исходного scaffold
 
@@ -95,6 +99,10 @@ allowed user id; исправленный удалённый GitHub Actions run 
 22. Consistency verifier мог autoflush чужие pending ORM changes вызывающей сессии.
 23. Shallow checkout и обычный pytest exit code позволяли CI не доказать full-history scan и
     скрыть skips.
+24. Production entrypoint передавал model string без NVIDIA custom endpoint и не поддерживал
+    локальный `.env` до импорта process-level DB resources.
+25. Relative dates передавались LLM без явного текущего времени.
+26. Штатный backend restart через `Ctrl+C` печатал полный Python traceback.
 
 ## Проверено в текущем окружении
 
@@ -102,7 +110,7 @@ allowed user id; исправленный удалённый GitHub Actions run 
 - `alembic downgrade base && alembic upgrade head`: **OK** на PostgreSQL.
 - Acceptance 1–9: **9 passed**.
 - Pydantic AI conversation eval: **3 passed**.
-- Полный `pytest -ra` с owner/runtime URLs и `ELOWYN_FAIL_ON_SKIP=1`: **58 passed**, без skip.
+- Полный `pytest -ra` с owner/runtime URLs и `ELOWYN_FAIL_ON_SKIP=1`: **60 passed**, без skip.
 - Concurrency suite: два update, update+undo, два supersede, duplicate relation, concurrent
   parent/dependency cycles и deadlock-sensitive opposite lock order — **OK**.
 - Runtime permission suite и deterministic adapter/Pydantic/Core/runtime PostgreSQL chain — **OK**.
@@ -115,15 +123,22 @@ allowed user id; исправленный удалённый GitHub Actions run 
 - `python -m compileall -q src tests scripts`: **OK**.
 - Установленные ключевые зависимости: aiogram 3.30.0, asyncpg 0.31.0, Pydantic AI 2.33.0,
   SQLAlchemy 2.0.52, Alembic 1.19.1.
-- Предыдущий удалённый CI run `4560e7d` был красным на старом workflow; исправленный workflow
-  полностью воспроизведён локально, но ещё не публиковался.
+- NVIDIA text smoke и реальный Pydantic `TaskCreate` tool/JSON call — **OK**.
+- Real NVIDIA DB cases create/update/ambiguity/correction/undo на отдельной test DB — **OK**.
+- Обычная runtime DB `elowyn_dev`: migrations owner + ограниченная `elowyn_dev_runtime` application
+  role — **OK**.
+- Telegram network smoke A–F: greeting, create, state query, update, backend restart/query и
+  ambiguity clarification without mutation — **OK**.
+- Replay реального Telegram update не создаёт duplicate Message/Task/Event; foreign-user update
+  отсекается aiogram router до handler/persistence — **OK**.
+- Telegram responses не содержат entity UUID, SQL/CRUD/tool names или configured credentials —
+  **OK**.
 
 ## Что ещё не подтверждено
 
-- Настоящий Telegram network → hosted Pydantic AI provider E2E: credentials в окружении отсутствуют.
 - Secret Scanning / Push Protection: `gh` отсутствует, unauthenticated GitHub API эту настройку не
   раскрывает.
-- Исправленный удалённый GitHub Actions workflow ещё не опубликован/запущен.
+- Текущая feature-ветка ещё не прошла удалённый CI и не merge-нута в `main`.
 
 ## Полученные safety guarantees
 
@@ -146,7 +161,7 @@ allowed user id; исправленный удалённый GitHub Actions run 
   worker architecture.
 - Локальный recovery drill не заменяет production backup retention, off-site storage, PITR и
   регулярную operator-проверку.
-- Реальное качество/поведение внешнего LLM provider и Telegram network пока не доказано.
+- Длительные реальные разговоры и provider availability/SLA не покрываются коротким v0.1 smoke.
 
 ## Неблокирующая заметка для roadmap
 

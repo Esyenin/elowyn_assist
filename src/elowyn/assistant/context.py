@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from elowyn.db.models import Message
 from elowyn.domain.enums import MessageAuthor
 
 
-def build_turn_prompt(*, user_text: str, world_state: str, history: list[Message]) -> str:
+def build_turn_prompt(
+    *,
+    user_text: str,
+    world_state: str,
+    history: list[Message],
+    current_time: datetime | None = None,
+) -> str:
     history_lines: list[str] = []
     for message in history:
         if not message.text:
@@ -13,7 +21,11 @@ def build_turn_prompt(*, user_text: str, world_state: str, history: list[Message
         history_lines.append(f"{role}: {message.text}")
     history_text = "\n".join(history_lines[-12:]) or "(нет предыдущих сообщений)"
 
-    return f"""ТЕКУЩИЙ WORLD STATE (authoritative; внутренние entity_id не показывай пользователю):
+    now = current_time or datetime.now(UTC)
+    return f"""ТЕКУЩАЯ ДАТА И ВРЕМЯ (для относительных дат):
+{now.isoformat()}
+
+ТЕКУЩИЙ WORLD STATE (authoritative; внутренние entity_id не показывай пользователю):
 {world_state}
 
 ПОСЛЕДНИЙ КОНТЕКСТ РАЗГОВОРА:

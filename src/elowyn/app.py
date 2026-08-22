@@ -20,19 +20,24 @@ def _required_int(name: str) -> int:
 
 
 async def main() -> None:
+    from dotenv import load_dotenv
+
+    # Load local development configuration before importing modules with process-level resources.
+    load_dotenv(override=False)
+
     from aiogram import Bot, Dispatcher
 
     from elowyn.db.session import SessionFactory
+    from elowyn.provider import build_runtime_model
     from elowyn.runtime import ElowynRuntime
     from elowyn.transport.telegram import TelegramAdapter, build_router
 
     token = _required_env("TELEGRAM_BOT_TOKEN")
-    model = _required_env("ELOWYN_MODEL")
     allowed_user_id = _required_int("TELEGRAM_ALLOWED_USER_ID")
 
     bot = Bot(token=token)
     dp = Dispatcher()
-    runtime = ElowynRuntime(session_factory=SessionFactory, model=model)
+    runtime = ElowynRuntime(session_factory=SessionFactory, model=build_runtime_model())
     adapter = TelegramAdapter(allowed_user_id=allowed_user_id)
     dp.include_router(build_router(runtime.handle_message, adapter=adapter))
 
@@ -41,4 +46,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

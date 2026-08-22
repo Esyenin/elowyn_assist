@@ -43,8 +43,9 @@ python -m elowyn.app
 - `DATABASE_URL` — PostgreSQL через `asyncpg`;
 - `TELEGRAM_BOT_TOKEN` — Bot API token;
 - `TELEGRAM_ALLOWED_USER_ID` — единственный разрешённый Telegram user id v0.1;
-- `ELOWYN_MODEL` — model string, понятный Pydantic AI; provider credentials задаются стандартными
-  переменными выбранного provider.
+- `NVIDIA_API_KEY` — ключ NVIDIA hosted API;
+- `NVIDIA_MODEL` — model id для NVIDIA NIM. Runtime использует OpenAI-compatible endpoint
+  `https://integrate.api.nvidia.com/v1`; Core от provider не зависит.
 
 `TELEGRAM_ALLOWED_USER_ID` обязателен: production entrypoint работает deny-by-default, а не открывает
 персонального ассистента всем пользователям бота.
