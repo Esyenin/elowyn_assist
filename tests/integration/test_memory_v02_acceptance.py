@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 import pytest
 from aiogram.types import Message as TelegramMessage
@@ -217,16 +218,60 @@ async def _isolated_source_service(factory, message: Message):
     return isolated, recalled.text
 
 
-def _restart_hindsight(container_name: str, base_url: str) -> None:
+def _replace_hindsight_backend(
+    container_name: str,
+    volume_name: str,
+    image: str,
+    base_url: str,
+) -> None:
+    """Simulate complete backend loss while preserving the test endpoint."""
+
     subprocess.run(
-        ["docker", "stop", "--time", "60", container_name],
+        ["docker", "rm", "--force", container_name],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     subprocess.run(
-        ["docker", "start", container_name],
+        ["docker", "volume", "rm", "--force", volume_name],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    subprocess.run(
+        ["docker", "volume", "create", volume_name],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    port = urlparse(base_url).port
+    assert port is not None
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--detach",
+            "--name",
+            container_name,
+            "--publish",
+            f"127.0.0.1:{port}:8888",
+            "--volume",
+            f"{volume_name}:/home/hindsight/.pg0",
+            "--env",
+            "HINDSIGHT_API_DATABASE_URL=pg0",
+            "--env",
+            "HINDSIGHT_API_LLM_PROVIDER=mock",
+            "--env",
+            "HINDSIGHT_API_LLM_API_KEY=synthetic-test-only",
+            "--env",
+            "HINDSIGHT_API_LLM_MODEL=mock-model",
+            "--env",
+            "HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION=false",
+            image,
+        ],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -241,7 +286,7 @@ def _restart_hindsight(container_name: str, base_url: str) -> None:
         except (OSError, urllib.error.URLError):
             pass
         time.sleep(1)
-    raise AssertionError("Hindsight did not become ready after restart")
+    raise AssertionError("replacement Hindsight backend did not become ready")
 
 
 @pytest.mark.asyncio
@@ -249,7 +294,11 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
     base_url = os.getenv("ELOWYN_TEST_HINDSIGHT_URL")
     database_url = os.getenv("TEST_DATABASE_URL")
     container_name = os.getenv("ELOWYN_TEST_HINDSIGHT_CONTAINER")
-    if not base_url or not database_url or not container_name:
+    volume_name = os.getenv("ELOWYN_TEST_HINDSIGHT_VOLUME")
+    hindsight_image = os.getenv("ELOWYN_TEST_HINDSIGHT_IMAGE")
+    if not all(
+        (base_url, database_url, container_name, volume_name, hindsight_image)
+    ):
         pytest.skip("real Hindsight/PostgreSQL acceptance environment is not configured")
 
     engine = create_async_engine(database_url)
@@ -538,7 +587,15 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
         accepted.update((10, 11))
 
         await memory.close()
-        await asyncio.to_thread(_restart_hindsight, container_name, base_url)
+        await asyncio.to_thread(
+            _replace_hindsight_backend,
+            container_name,
+            volume_name,
+            hindsight_image,
+            base_url,
+        )
+        replacement = await manager.rebuild(explicit=True)
+        assert replacement.bank_id != rebuilt.bank_id
         memory = ActiveGenerationMemoryService(
             session_factory,
             backend=backend,

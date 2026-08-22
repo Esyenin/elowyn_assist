@@ -19,7 +19,10 @@ Prerequisites are Docker, a migrated PostgreSQL acceptance database exposed as
 4. waits for `/health/ready`;
 5. passes the Hindsight URL/container identity only to the integration-test process and
    fails the gate on any skip;
-6. removes the ephemeral container, volume, and all test banks on exit.
+6. exercises catastrophic backend replacement by discarding the test pg0 volume,
+   rebuilding a new generation from the canonical Core archive, and recalling
+   through the same endpoint;
+7. removes the ephemeral container, volume, and all test banks on exit.
 
 The same command runs in the `memory-integration` GitHub Actions job. The
 container receives no Core database URL or credentials.
