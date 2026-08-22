@@ -138,7 +138,8 @@ merge feature-ветки и release tag выполняются только от
 
 - Secret Scanning / Push Protection: `gh` отсутствует, unauthenticated GitHub API эту настройку не
   раскрывает.
-- Текущая feature-ветка ещё не прошла удалённый CI и не merge-нута в `main`.
+- GitHub Actions на feature-ветке после runtime gate: Ruff/mypy, полный PostgreSQL suite и recovery
+  drill — **OK**; ветка ещё не merge-нута в `main`.
 
 ## Полученные safety guarantees
 
