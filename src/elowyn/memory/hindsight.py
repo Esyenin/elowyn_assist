@@ -113,6 +113,11 @@ class HindsightAdapter:
 
         await self._require_pinned_version()
         stable_operation_id = operation_id or operation_id_for(self.config.bank_id, messages)
+        backend_operation_id = (
+            _bank_scoped_operation_id(self.config.bank_id, operation_id)
+            if operation_id is not None
+            else stable_operation_id
+        )
         items = [_retain_item(message) for message in messages]
         try:
             response = await self._client.aretain_batch(
@@ -121,16 +126,16 @@ class HindsightAdapter:
                 document_id=document_id_for(conversation_id),
                 document_tags=["elowyn", "conversation"],
                 retain_async=True,
-                operation_id=str(stable_operation_id),
+                operation_id=str(backend_operation_id),
             )
         except Exception as exc:
             raise MemoryBackendError("Hindsight retain failed") from exc
         if not bool(response.success):
             raise MemoryBackendError("Hindsight rejected retain")
         returned_operation_id = getattr(response, "operation_id", None)
-        if returned_operation_id and str(returned_operation_id) != str(stable_operation_id):
+        if returned_operation_id and str(returned_operation_id) != str(backend_operation_id):
             raise MemoryBackendError("Hindsight returned an unexpected operation ID")
-        await self._wait_for_retain(stable_operation_id)
+        await self._wait_for_retain(backend_operation_id)
         return RetainResult(
             operation_id=stable_operation_id,
             accepted_items=int(response.items_count),
@@ -262,6 +267,12 @@ def document_id_for(conversation_id: uuid.UUID) -> str:
 def operation_id_for(bank_id: str, messages: tuple[RetainMessage, ...]) -> uuid.UUID:
     message_ids = ",".join(sorted(str(message.source.message_id) for message in messages))
     return uuid.uuid5(_OPERATION_NAMESPACE, f"{bank_id}:{message_ids}")
+
+
+def _bank_scoped_operation_id(bank_id: str, operation_id: uuid.UUID) -> uuid.UUID:
+    # Hindsight 0.9.1 stores operation_id as a global primary key. Elowyn's
+    # logical retry identity must therefore be translated per generation bank.
+    return uuid.uuid5(_OPERATION_NAMESPACE, f"{bank_id}:logical:{operation_id}")
 
 
 def _retain_item(message: RetainMessage) -> dict[str, Any]:

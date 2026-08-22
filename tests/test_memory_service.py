@@ -152,6 +152,29 @@ async def test_adapter_maps_stable_source_metadata_and_retry_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_scopes_elowyn_operation_identity_to_generation_bank() -> None:
+    logical_operation_id = uuid.UUID("30000000-0000-0000-0000-000000000003")
+    first_client = FakeHindsight()
+    second_client = FakeHindsight()
+    first = HindsightAdapter(
+        HindsightConfig(base_url="http://memory.invalid", bank_id="generation-one"),
+        client=first_client,
+    )
+    second = HindsightAdapter(
+        HindsightConfig(base_url="http://memory.invalid", bank_id="generation-two"),
+        client=second_client,
+    )
+
+    first_result = await first.retain((_message(),), operation_id=logical_operation_id)
+    second_result = await second.retain((_message(),), operation_id=logical_operation_id)
+
+    assert first_result.operation_id == second_result.operation_id == logical_operation_id
+    assert first_client.retain_calls[0]["operation_id"] != second_client.retain_calls[0][
+        "operation_id"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_recall_and_reflect_are_explicitly_non_authoritative() -> None:
     client = FakeHindsight()
     adapter = HindsightAdapter(
