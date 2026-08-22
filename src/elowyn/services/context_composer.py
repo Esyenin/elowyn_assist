@@ -84,6 +84,7 @@ class _RankedMemory:
     text: str
     relevance: float
     stable_key: str
+    dedupe_key: str
 
 
 class ContextComposer:
@@ -149,6 +150,7 @@ class ContextComposer:
                         relevance=relevance
                         + (0.1 if entry.status == ObservationStatus.ACTIVE else 0),
                         stable_key=str(entry.observation_id),
+                        dedupe_key=_normalized(entry.statement),
                     )
                 )
         return _deduplicated(ranked)
@@ -202,8 +204,14 @@ def _shadowed_by_current(
         normalized in _normalized(world_state) or normalized in _normalized(recent_text)
     ):
         return True
-    user_terms = _terms(user_text)
     statement_terms = _terms(statement)
+    world_terms = _terms(world_state)
+    # Canonical World State wins when it addresses substantially the same claim,
+    # even if the remembered value conflicts (for example SQLite vs PostgreSQL).
+    shared_world_terms = statement_terms & world_terms
+    if len(shared_world_terms) >= 2 and len(shared_world_terms) / len(statement_terms) >= 0.5:
+        return True
+    user_terms = _terms(user_text)
     is_question = "?" in user_text or bool(user_terms & _QUESTION_MARKERS)
     explicit_update = not is_question and bool(user_terms & _EXPLICIT_UPDATE_MARKERS)
     if explicit_update and statement_terms:
@@ -215,7 +223,7 @@ def _shadowed_by_current(
 def _deduplicated(items: list[_RankedMemory]) -> list[_RankedMemory]:
     result: dict[str, _RankedMemory] = {}
     for item in items:
-        key = _normalized(item.text.partition("]")[2])
+        key = item.dedupe_key
         previous = result.get(key)
         if previous is None or item.relevance > previous.relevance:
             result[key] = item

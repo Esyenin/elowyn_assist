@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +68,50 @@ def test_semantic_categories_preserve_claim_modality(
 
     assert semantics.category == category
     assert semantics.status == status
+
+
+def test_mixed_message_stays_conservative_instead_of_promoting_possible_idea() -> None:
+    semantics = classify_semantics(
+        "Мне обычно нравятся короткие ответы, но для Elowyn давай подробно. "
+        "И возможно потом попробуем Neo4j."
+    )
+
+    assert semantics.category == SemanticCategory.IDEA
+    assert semantics.status == EpistemicStatus.CONSIDERED
+    assert semantics.status not in {EpistemicStatus.PREFERRED, EpistemicStatus.CURRENTLY_TRUE}
+
+
+def test_uncertain_statement_is_not_current_truth() -> None:
+    semantics = classify_semantics("Rust might be useful for one component.")
+
+    assert semantics.category == SemanticCategory.IDEA
+    assert semantics.status == EpistemicStatus.CONSIDERED
+
+
+def test_adversarial_dataset_preserves_modality_and_temporal_distinctions() -> None:
+    dataset = json.loads(
+        (Path(__file__).parent / "fixtures" / "memory_v02_golden.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    fragments = {item["id"]: item["text"] for item in dataset["fragments"]}
+
+    assert classify_semantics(fragments["idea-neo4j"]).status == EpistemicStatus.CONSIDERED
+    assert classify_semantics(fragments["decision-postgres"]).status == EpistemicStatus.DECIDED
+    assert classify_semantics(fragments["discussion-kafka"]).status != EpistemicStatus.DECIDED
+    assert classify_semantics(fragments["fact-storage-old"]).status != (
+        EpistemicStatus.CURRENTLY_TRUE
+    )
+    assert (
+        classify_semantics(fragments["fact-storage-current"]).status
+        == EpistemicStatus.CURRENTLY_TRUE
+    )
+    assert classify_semantics(fragments["temporary-coffee"]).status != (
+        EpistemicStatus.PREFERRED
+    )
+    assert classify_semantics(fragments["uncertain-rust"]).status != (
+        EpistemicStatus.CURRENTLY_TRUE
+    )
 
 
 class RecallClient:

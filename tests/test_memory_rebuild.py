@@ -356,6 +356,40 @@ async def test_mid_rebuild_failure_preserves_old_active_generation_and_derivativ
 
 
 @pytest.mark.asyncio
+async def test_failure_after_backend_replay_before_switch_keeps_registry_and_world_state(
+    session_factory, monkeypatch
+) -> None:
+    await _seed_archive_and_world_state(session_factory)
+    factory = GenerationFactory()
+    factory.open("stable-bank")
+    manager = _manager(session_factory, factory)
+    stable_id = await manager.bootstrap_existing("stable-bank")
+    async with session_factory() as session:
+        world_before = await _world_counts(session)
+
+    async def fail_derived(session) -> None:
+        raise RuntimeError("synthetic derived consolidation failure")
+
+    monkeypatch.setattr(manager, "_rebuild_derived", fail_derived)
+    with pytest.raises(MemoryRebuildError, match="memory rebuild failed"):
+        await manager.rebuild(explicit=True)
+
+    assert (await _active_generation(session_factory)).id == stable_id
+    failed_bank = factory.banks[factory.created[-1]]
+    assert len(failed_bank.items) == 4
+    async with session_factory() as session:
+        assert await _world_counts(session) == world_before
+        failed = (
+            await session.execute(
+                select(MemoryGeneration).where(
+                    MemoryGeneration.status == MemoryGenerationStatus.FAILED
+                )
+            )
+        ).scalar_one()
+        assert failed.bank_id == factory.created[-1]
+
+
+@pytest.mark.asyncio
 async def test_interrupted_rebuild_is_detected_then_restart_builds_a_new_bank(
     session_factory,
 ) -> None:

@@ -296,3 +296,69 @@ async def test_post_commit_wakeup_runs_ingestion_outside_the_turn(session_factor
     assert [call[0].source.message_id for call in memory.calls] == [messages[0].id]
     _, receipt_count = await _state_snapshot(session_factory)
     assert receipt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_after_backend_completion_before_receipt_replays_same_operation(
+    session_factory, monkeypatch
+) -> None:
+    started = datetime.now(UTC)
+    _, messages = await _seed_messages(session_factory, 1)
+    memory = RecordingMemory()
+    config = MemoryPipelineConfig(
+        backend="synthetic-v1",
+        lease_for=timedelta(seconds=1),
+    )
+    crashed = MemoryIngestionProcessor(session_factory, memory, config)
+
+    async def crash_before_receipt(state_id, message_id) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(crashed, "_record_receipt", crash_before_receipt)
+    with pytest.raises(asyncio.CancelledError):
+        await crashed.process_once(now=started)
+
+    state, receipt_count = await _state_snapshot(session_factory)
+    assert state.status == MemoryIngestionStatus.PROCESSING
+    assert receipt_count == 0
+    recovered = MemoryIngestionProcessor(session_factory, memory, config)
+    assert await recovered.process_once(now=started + timedelta(seconds=2)) is True
+    state, receipt_count = await _state_snapshot(session_factory)
+    assert state.status == MemoryIngestionStatus.IDLE
+    assert receipt_count == 1
+    assert state.last_succeeded_message_id == messages[0].id
+    assert len(memory.calls) == 2
+    assert memory.calls[0][1] == memory.calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_crash_after_receipt_before_batch_finish_does_not_retain_again(
+    session_factory, monkeypatch
+) -> None:
+    started = datetime.now(UTC)
+    _, messages = await _seed_messages(session_factory, 1)
+    memory = RecordingMemory()
+    config = MemoryPipelineConfig(
+        backend="synthetic-v1",
+        lease_for=timedelta(seconds=1),
+    )
+    crashed = MemoryIngestionProcessor(session_factory, memory, config)
+
+    async def crash_before_finish(batch) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(crashed, "_finish", crash_before_finish)
+    with pytest.raises(asyncio.CancelledError):
+        await crashed.process_once(now=started)
+
+    state, receipt_count = await _state_snapshot(session_factory)
+    assert state.status == MemoryIngestionStatus.PROCESSING
+    assert state.last_succeeded_message_id == messages[0].id
+    assert receipt_count == 1
+    recovered = MemoryIngestionProcessor(session_factory, memory, config)
+    assert await recovered.process_once(now=started + timedelta(seconds=2)) is False
+    state, receipt_count = await _state_snapshot(session_factory)
+    assert state.status == MemoryIngestionStatus.IDLE
+    assert state.last_succeeded_message_id == messages[0].id
+    assert receipt_count == 1
+    assert len(memory.calls) == 1

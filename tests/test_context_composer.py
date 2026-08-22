@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +227,91 @@ async def test_world_state_and_recent_context_are_not_duplicated(session_factory
 
         assert from_world is None
         assert from_recent is None
+
+
+@pytest.mark.asyncio
+async def test_conflicting_world_state_suppresses_same_claim_from_memory(session_factory) -> None:
+    async with session_factory() as session:
+        await _page(
+            session,
+            "Project Aurora",
+            [_entry("Project Aurora uses SQLite.", claim_key="project.aurora.storage")],
+        )
+
+        context = await ContextComposer(session).memory_context(
+            user_text="What storage does Project Aurora use?",
+            world_state='{"project": {"name": "Aurora", "storage": "PostgreSQL"}}',
+            history=[],
+        )
+
+        assert context is None or "SQLite" not in context.text
+
+
+@pytest.mark.asyncio
+async def test_duplicate_claim_across_pages_is_emitted_once(session_factory) -> None:
+    async with session_factory() as session:
+        statement = "User prefers concise technical answers."
+        await _page(session, "Communication Preferences", [_entry(statement)])
+        await _page(session, "User Profile", [_entry(statement)])
+
+        context = await ContextComposer(session).memory_context(
+            user_text="What technical answers does the user prefer?",
+            world_state="{}",
+            history=[],
+        )
+
+        assert context is not None
+        assert context.text.count(statement) == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_golden_dataset_filters_noise_and_bounds_growth(session_factory) -> None:
+    dataset_path = Path(__file__).parent / "fixtures" / "memory_v02_golden.json"
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    fragments = {item["id"]: item for item in dataset["fragments"]}
+    excluded_from_active_pages = {"fact-storage-old", "duplicate-concise"}
+
+    async with session_factory() as session:
+        for item in fragments.values():
+            if item["id"] in excluded_from_active_pages:
+                continue
+            await _page(
+                session,
+                f"Topic {item['topic']} {item['id']}",
+                [_entry(item["text"], claim_key=f"golden.{item['id']}")],
+            )
+        composer = ContextComposer(
+            session,
+            ContextComposerConfig(memory_token_budget=420, memory_item_limit=6),
+        )
+
+        for query in dataset["queries"]:
+            context = await composer.memory_context(
+                user_text=query["text"], world_state="{}", history=[]
+            )
+            assert context is not None
+            assert context.token_upper_bound <= 420
+            assert context.item_count <= 6
+            for fragment_id in query["must_include"]:
+                assert fragments[fragment_id]["text"] in context.text
+            for fragment_id in query["must_exclude"]:
+                assert fragments[fragment_id]["text"] not in context.text
+
+        expanded_history = [
+            Message(
+                conversation_id=uuid.uuid4(),
+                author=MessageAuthor.USER,
+                text=f"unrelated history {index}",
+                sent_at=datetime.now(UTC),
+            )
+            for index in range(200)
+        ]
+        bounded = await composer.memory_context(
+            user_text=dataset["queries"][0]["text"],
+            world_state="{}",
+            history=expanded_history,
+        )
+        assert bounded is not None and bounded.token_upper_bound <= 420
 
 
 @pytest.mark.asyncio
