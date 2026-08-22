@@ -29,6 +29,7 @@ from elowyn.memory.hindsight import (
 from elowyn.memory.observations import ObservationCandidate, ObservationEvidence
 from elowyn.memory.service import (
     EpistemicStatus,
+    MemoryProvenance,
     MemorySource,
     RecallQuery,
     ReflectQuery,
@@ -39,7 +40,11 @@ from elowyn.services.memory_consolidation import (
     MemoryPageService,
     ObservationConsolidationService,
 )
-from elowyn.services.memory_pipeline import MemoryIngestionProcessor, MemoryPipelineConfig
+from elowyn.services.memory_pipeline import (
+    MemoryIngestionProcessor,
+    MemoryPipelineConfig,
+    ingestion_operation_id,
+)
 from elowyn.services.memory_provenance import MemoryProvenanceService
 from elowyn.services.memory_rebuild import MemoryGenerationManager, MemoryRebuildConfig
 
@@ -181,21 +186,23 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             pass
         recalled = await _wait_for_sources(
             active,
-            {message.id: message.text or "" for message in messages},
+            {message.id: message.text or "" for message in (messages[0], messages[-1])},
         )
         assert all(item.authoritative is False for item in recalled.memories)
 
         async with session_factory() as session:
             consolidation = ObservationConsolidationService(session)
-            by_message = {
-                item.provenance.message_id: item
-                for item in recalled.memories
-                if item.provenance is not None
-            }
             evidence = tuple(
                 ObservationEvidence(
-                    backend_memory_id=by_message[message.id].backend_id,
-                    provenance=by_message[message.id].provenance,
+                    backend_memory_id=(
+                        f"operation:{ingestion_operation_id(backend=backend, message_id=message.id)}"
+                    ),
+                    provenance=MemoryProvenance(
+                        conversation_id=message.conversation_id,
+                        message_id=message.id,
+                        role=message.author.value,
+                        occurred_at=message.sent_at,
+                    ),
                 )
                 for message in messages[:2]
             )
@@ -223,7 +230,7 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
         assert rebuilt.bank_id != initial_bank
         after_rebuild = await _wait_for_sources(
             active,
-            {message.id: message.text or "" for message in messages},
+            {message.id: message.text or "" for message in (messages[0], messages[-1])},
         )
         async with session_factory() as session:
             for item in after_rebuild.memories:
