@@ -134,7 +134,7 @@ def main() -> int:
         if completed.stdout:
             print(completed.stdout)
         if completed.returncode != 0:
-            _github_error((completed.stdout or "pytest failed")[-3000:])
+            _github_error((completed.stdout or "pytest failed")[-8000:])
             _show_logs(container_name)
         return completed.returncode
     except (OSError, RuntimeError, TimeoutError) as exc:
