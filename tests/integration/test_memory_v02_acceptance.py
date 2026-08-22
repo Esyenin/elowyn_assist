@@ -219,7 +219,14 @@ async def _isolated_source_service(factory, message: Message):
 
 def _restart_hindsight(container_name: str, base_url: str) -> None:
     subprocess.run(
-        ["docker", "restart", container_name],
+        ["docker", "stop", "--time", "60", container_name],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    subprocess.run(
+        ["docker", "start", container_name],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

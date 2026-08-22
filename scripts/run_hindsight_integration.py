@@ -83,18 +83,26 @@ def main() -> int:
         return 2
 
     container_name = f"elowyn-hindsight-integration-{uuid.uuid4().hex[:12]}"
+    volume_name = f"elowyn-hindsight-data-{uuid.uuid4().hex[:12]}"
     started = False
+    volume_created = False
     try:
+        volume = _run(["docker", "volume", "create", volume_name], check=False)
+        if volume.returncode != 0:
+            print(volume.stdout, file=sys.stderr)
+            return volume.returncode
+        volume_created = True
         result = _run(
             [
                 "docker",
                 "run",
                 "--detach",
-                "--rm",
                 "--name",
                 container_name,
                 "--publish",
                 "127.0.0.1::8888",
+                "--volume",
+                f"{volume_name}:/home/hindsight/.pg0",
                 "--env",
                 "HINDSIGHT_API_DATABASE_URL=pg0",
                 "--env",
@@ -154,6 +162,8 @@ def main() -> int:
     finally:
         if started:
             _run(["docker", "rm", "--force", container_name], check=False)
+        if volume_created:
+            _run(["docker", "volume", "rm", "--force", volume_name], check=False)
 
 
 if __name__ == "__main__":
