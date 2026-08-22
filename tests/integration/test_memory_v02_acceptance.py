@@ -45,7 +45,7 @@ from elowyn.services.memory_provenance import MemoryProvenanceService
 from elowyn.services.memory_rebuild import MemoryGenerationManager, MemoryRebuildConfig
 from elowyn.transport.telegram import TelegramAdapter
 
-pytestmark = (pytest.mark.hindsight, pytest.mark.postgres)
+pytestmark = [pytest.mark.hindsight, pytest.mark.postgres]
 
 
 def _prompt_text(messages) -> str:
