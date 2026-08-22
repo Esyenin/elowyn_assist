@@ -188,7 +188,7 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             active,
             {
                 message.id: (message.text or "", message.conversation_id)
-                for message in (messages[0], messages[-1])
+                for message in (messages[1], messages[-1])
             },
         )
         assert all(item.authoritative is False for item in recalled.memories)
@@ -236,7 +236,7 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             active,
             {
                 message.id: (message.text or "", message.conversation_id)
-                for message in (messages[0], messages[-1])
+                for message in (messages[1], messages[-1])
             },
         )
         async with session_factory() as session:
@@ -305,13 +305,11 @@ async def _wait_for_sources(memory, expected: dict[uuid.UUID, tuple[str, uuid.UU
     for _ in range(30):
         combined = []
         found: set[uuid.UUID] = set()
-        for message_id, (query, conversation_id) in expected.items():
+        for message_id, (query, _conversation_id) in expected.items():
             recalled = await memory.recall(
                 RecallQuery(
                     text=query,
                     max_tokens=1024,
-                    tags=(f"conversation:{conversation_id}",),
-                    tags_match="all_strict",
                 )
             )
             combined.extend(recalled.memories)

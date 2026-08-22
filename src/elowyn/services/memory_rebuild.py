@@ -347,15 +347,46 @@ class MemoryGenerationManager:
     async def _verify_index(self, memory: MemoryService, session) -> int:
         samples: list[Message] = []
         for descending in (False, True):
-            order = Message.created_at.desc() if descending else Message.created_at
-            message = (
+            conversation_order = (
+                Conversation.created_at.desc() if descending else Conversation.created_at
+            )
+            conversation_id = (
                 await session.execute(
-                    select(Message)
-                    .where(Message.text.is_not(None), func.length(func.trim(Message.text)) > 0)
-                    .order_by(order, Message.id.desc() if descending else Message.id)
+                    select(Conversation.id)
+                    .where(
+                        select(Message.id)
+                        .where(
+                            Message.conversation_id == Conversation.id,
+                            Message.text.is_not(None),
+                            func.length(func.trim(Message.text)) > 0,
+                        )
+                        .exists()
+                    )
+                    .order_by(
+                        conversation_order,
+                        Conversation.id.desc() if descending else Conversation.id,
+                    )
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            message = None
+            if conversation_id is not None:
+                message = (
+                    await session.execute(
+                        select(Message)
+                        .where(
+                            Message.conversation_id == conversation_id,
+                            Message.text.is_not(None),
+                            func.length(func.trim(Message.text)) > 0,
+                        )
+                        .order_by(
+                            Message.sent_at.desc(),
+                            Message.created_at.desc(),
+                            Message.id.desc(),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
             if message is not None and all(item.id != message.id for item in samples):
                 samples.append(message)
         for attempt in range(self.config.verification_attempts):

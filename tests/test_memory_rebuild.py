@@ -80,6 +80,7 @@ class GenerationMemory:
         self.fail_at: int | None = None
         self.cancel_at: int | None = None
         self.retain_calls = 0
+        self.recall_queries: list[str] = []
 
     async def health(self) -> MemoryHealth:
         return MemoryHealth(backend=self.bank_id, ready=self.ready)
@@ -102,6 +103,7 @@ class GenerationMemory:
         return RetainResult(operation_id=operation_id, accepted_items=len(messages))
 
     async def recall(self, query: RecallQuery) -> RecallResult:
+        self.recall_queries.append(query.text)
         memories = tuple(
             RecalledMemory(
                 backend_id=f"{self.bank_id}:{message.source.message_id}",
@@ -472,6 +474,57 @@ async def test_rebuild_requires_explicit_opt_in(session_factory) -> None:
     manager = _manager(session_factory, factory)
     with pytest.raises(PermissionError, match="explicit"):
         await manager.rebuild()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_verifies_latest_message_of_boundary_conversations(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        first = Conversation(
+            transport=TransportType.INTERNAL,
+            created_at=datetime(2026, 8, 23, 6, 0, tzinfo=UTC),
+        )
+        last = Conversation(
+            transport=TransportType.INTERNAL,
+            created_at=datetime(2026, 8, 23, 8, 0, tzinfo=UTC),
+        )
+        session.add_all((first, last))
+        await session.flush()
+        session.add_all(
+            (
+                Message(
+                    conversation_id=first.id,
+                    author=MessageAuthor.USER,
+                    text="obsolete first-conversation source",
+                    sent_at=datetime(2026, 8, 23, 7, 0, tzinfo=UTC),
+                ),
+                Message(
+                    conversation_id=first.id,
+                    author=MessageAuthor.USER,
+                    text="latest first-conversation source",
+                    sent_at=datetime(2026, 8, 23, 7, 1, tzinfo=UTC),
+                ),
+                Message(
+                    conversation_id=last.id,
+                    author=MessageAuthor.USER,
+                    text="latest last-conversation source",
+                    sent_at=datetime(2026, 8, 23, 7, 2, tzinfo=UTC),
+                ),
+            )
+        )
+        await session.commit()
+    factory = GenerationFactory()
+    factory.open("stable-bank")
+    manager = _manager(session_factory, factory)
+    await manager.bootstrap_existing("stable-bank")
+
+    result = await manager.rebuild(explicit=True)
+
+    assert factory.banks[result.bank_id].recall_queries == [
+        "latest first-conversation source",
+        "latest last-conversation source",
+    ]
 
 
 def _utc(value: datetime) -> datetime:
