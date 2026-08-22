@@ -195,7 +195,8 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             evidence = tuple(
                 ObservationEvidence(
                     backend_memory_id=(
-                        f"operation:{ingestion_operation_id(backend=backend, message_id=message.id)}"
+                        "operation:"
+                        f"{ingestion_operation_id(backend=backend, message_id=message.id)}"
                     ),
                     provenance=MemoryProvenance(
                         conversation_id=message.conversation_id,
