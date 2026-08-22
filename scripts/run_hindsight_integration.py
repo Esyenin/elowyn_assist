@@ -67,6 +67,13 @@ def _show_logs(container_name: str) -> None:
         print(logs.stdout, file=sys.stderr)
 
 
+def _github_error(message: str) -> None:
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        return
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error title=Real Hindsight integration gate::{escaped}")
+
+
 def main() -> int:
     if shutil.which("docker") is None:
         print("Docker is required for the real Hindsight integration gate.", file=sys.stderr)
@@ -120,12 +127,19 @@ def main() -> int:
             ],
             env=test_environment,
             check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
+        if completed.stdout:
+            print(completed.stdout)
         if completed.returncode != 0:
+            _github_error((completed.stdout or "pytest failed")[-3000:])
             _show_logs(container_name)
         return completed.returncode
     except (OSError, RuntimeError, TimeoutError) as exc:
         print(f"Hindsight integration harness failed: {exc}", file=sys.stderr)
+        _github_error(str(exc))
         if started:
             _show_logs(container_name)
         return 1
