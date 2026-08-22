@@ -100,6 +100,8 @@ def main() -> int:
                 "HINDSIGHT_API_LLM_API_KEY=synthetic-test-only",
                 "--env",
                 "HINDSIGHT_API_LLM_MODEL=mock-model",
+                "--env",
+                "HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION=false",
                 HINDSIGHT_IMAGE,
             ],
             check=False,
