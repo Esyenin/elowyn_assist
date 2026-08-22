@@ -24,6 +24,9 @@ EXPECTED_TABLES = {
     "source_dependencies",
     "operations",
     "events",
+    "conversation_summaries",
+    "memory_ingestion_states",
+    "memory_ingestion_receipts",
 }
 
 

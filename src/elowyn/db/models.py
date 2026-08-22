@@ -27,6 +27,7 @@ from elowyn.domain.enums import (
     EntityType,
     EventType,
     GoalStatus,
+    MemoryIngestionStatus,
     MessageAuthor,
     ProjectStatus,
     RelationType,
@@ -119,6 +120,93 @@ class Message(Base):
     )
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class ConversationSummary(Base):
+    """Disposable, Core-owned navigation shortcut derived from raw messages."""
+
+    __tablename__ = "conversation_summaries"
+    __table_args__ = (
+        CheckConstraint("length(trim(short_summary)) > 0", name="ck_summary_not_blank"),
+        CheckConstraint(
+            "length(trim(derivation_version)) > 0", name="ck_summary_version_not_blank"
+        ),
+    )
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    short_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    topics: Mapped[list[str]] = mapped_column(JSON_DATA, default=list, nullable=False)
+    related_entity_ids: Mapped[list[str]] = mapped_column(JSON_DATA, default=list, nullable=False)
+    last_processed_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    derivation_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryIngestionState(Base):
+    """Durable backend lease/cursor; receipts make the cursor lossless."""
+
+    __tablename__ = "memory_ingestion_states"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "backend", name="uq_memory_ingestion_backend"),
+        CheckConstraint("length(trim(backend)) > 0", name="ck_memory_backend_not_blank"),
+        CheckConstraint("attempts >= 0", name="ck_memory_ingestion_attempts"),
+        CheckConstraint(
+            "(status = 'PROCESSING' AND lease_expires_at IS NOT NULL) OR "
+            "(status <> 'PROCESSING' AND lease_expires_at IS NULL)",
+            name="ck_memory_ingestion_lease_consistent",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    backend: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_succeeded_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[MemoryIngestionStatus] = mapped_column(
+        enum_type(MemoryIngestionStatus, name="memory_ingestion_status"),
+        default=MemoryIngestionStatus.IDLE,
+        nullable=False,
+        index=True,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryIngestionReceipt(Base):
+    """Per-message success ledger used to discover every gap in the raw archive."""
+
+    __tablename__ = "memory_ingestion_receipts"
+
+    state_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_ingestion_states.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    succeeded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class Source(Base):

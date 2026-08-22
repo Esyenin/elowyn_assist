@@ -71,6 +71,12 @@ class MessageAuthor(StrEnum):
     EXTERNAL = "EXTERNAL"
 
 
+class MemoryIngestionStatus(StrEnum):
+    IDLE = "IDLE"
+    PROCESSING = "PROCESSING"
+    FAILED = "FAILED"
+
+
 class SourceType(StrEnum):
     USER_MESSAGE = "USER_MESSAGE"
     ASSISTANT_INFERENCE = "ASSISTANT_INFERENCE"
