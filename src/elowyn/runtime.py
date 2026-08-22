@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 
 from elowyn.assistant.context import build_turn_prompt
 from elowyn.assistant.tools import build_agent
@@ -14,9 +15,16 @@ from elowyn.services.world_state import ActionContext, WorldStateService
 class ElowynRuntime:
     """One transport-independent conversational turn over persistent World State."""
 
-    def __init__(self, *, session_factory, model):
+    def __init__(
+        self,
+        *,
+        session_factory,
+        model,
+        memory_ingestion_wakeup: Callable[[], None] | None = None,
+    ):
         self.session_factory = session_factory
         self.model = model
+        self.memory_ingestion_wakeup = memory_ingestion_wakeup
 
     async def handle_message(self, incoming: IncomingMessage) -> str | None:
         async with self.session_factory() as session:
@@ -24,6 +32,7 @@ class ElowynRuntime:
             ingested = await conversation_service.ingest_user_message(incoming)
             # Preserve the original Message/Source even if the model provider fails later.
             await session.commit()
+            self._wake_memory_ingestion()
             if not ingested.is_new and await conversation_service.has_assistant_reply(
                 conversation_id=ingested.conversation.id,
                 user_message_id=ingested.message.id,
@@ -63,8 +72,19 @@ class ElowynRuntime:
                     in_reply_to_message_id=ingested.message.id,
                 )
                 await session.commit()
+                self._wake_memory_ingestion()
                 return response
             except Exception:
                 # Domain writes from a failed agent turn must not become canonical state.
                 await session.rollback()
                 raise
+
+    def _wake_memory_ingestion(self) -> None:
+        if self.memory_ingestion_wakeup is None:
+            return
+        try:
+            self.memory_ingestion_wakeup()
+        except Exception:
+            # Scheduling is advisory: the periodic raw-archive scan remains the
+            # durable catch-up mechanism and the user turn must stay successful.
+            return

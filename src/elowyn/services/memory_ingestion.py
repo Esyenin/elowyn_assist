@@ -21,6 +21,7 @@ class CatchUpBatch:
     state_id: uuid.UUID
     conversation_id: uuid.UUID
     backend: str
+    attempt: int
     messages: tuple[Message, ...]
 
     @property
@@ -85,10 +86,13 @@ class MemoryIngestionStateService:
                 self.session.add(state)
                 await self.session.flush()
             elif state.status == MemoryIngestionStatus.PROCESSING and (
-                state.lease_expires_at is not None and state.lease_expires_at > current_time
+                state.lease_expires_at is not None
+                and _as_utc(state.lease_expires_at) > _as_utc(current_time)
             ):
                 continue
-            elif state.next_attempt_at is not None and state.next_attempt_at > current_time:
+            elif state.next_attempt_at is not None and _as_utc(
+                state.next_attempt_at
+            ) > _as_utc(current_time):
                 continue
 
             already_succeeded = (
@@ -114,7 +118,10 @@ class MemoryIngestionStateService:
             )
             if not messages:
                 state.status = MemoryIngestionStatus.IDLE
+                state.attempts = 0
+                state.next_attempt_at = None
                 state.lease_expires_at = None
+                state.last_error = None
                 continue
 
             state.status = MemoryIngestionStatus.PROCESSING
@@ -127,6 +134,7 @@ class MemoryIngestionStateService:
                 state_id=state.id,
                 conversation_id=conversation_id,
                 backend=self.backend,
+                attempt=state.attempts,
                 messages=tuple(messages),
             )
         return None
@@ -137,21 +145,37 @@ class MemoryIngestionStateService:
         if not message_ids:
             raise ValueError("successful ingestion must contain at least one message")
         state = await self._locked_state(state_id)
-        messages: list[Message] = []
-        for message_id in dict.fromkeys(message_ids):
-            message = await self.session.get(Message, message_id)
-            if message is None or message.conversation_id != state.conversation_id:
-                raise ValueError("ingested messages must belong to the ingestion conversation")
-            messages.append(message)
-            receipt = await self.session.get(MemoryIngestionReceipt, (state.id, message.id))
-            if receipt is None:
-                self.session.add(MemoryIngestionReceipt(state_id=state.id, message_id=message.id))
+        messages = await self._record_receipts(state, message_ids)
         state.last_succeeded_message_id = messages[-1].id
         state.status = MemoryIngestionStatus.IDLE
         state.attempts = 0
         state.next_attempt_at = None
         state.lease_expires_at = None
         state.last_error = None
+        await self.session.flush()
+
+    async def record_message_succeeded(
+        self, *, state_id: uuid.UUID, message_id: uuid.UUID
+    ) -> None:
+        """Persist one backend-confirmed receipt while retaining the batch lease."""
+        state = await self._locked_state(state_id)
+        messages = await self._record_receipts(state, (message_id,))
+        state.last_succeeded_message_id = messages[-1].id
+        await self.session.flush()
+
+    async def renew_lease(
+        self,
+        *,
+        state_id: uuid.UUID,
+        lease_for: timedelta,
+        now: datetime | None = None,
+    ) -> None:
+        if lease_for <= timedelta(0):
+            raise ValueError("lease duration must be positive")
+        state = await self._locked_state(state_id)
+        if state.status != MemoryIngestionStatus.PROCESSING:
+            raise ValueError("only a processing ingestion batch can renew its lease")
+        state.lease_expires_at = (now or datetime.now(UTC)) + lease_for
         await self.session.flush()
 
     async def mark_failed(
@@ -182,3 +206,25 @@ class MemoryIngestionStateService:
         if state is None:
             raise ValueError("memory ingestion state was not found for backend")
         return state
+
+    async def _record_receipts(
+        self,
+        state: MemoryIngestionState,
+        message_ids: tuple[uuid.UUID, ...],
+    ) -> list[Message]:
+        messages: list[Message] = []
+        for message_id in dict.fromkeys(message_ids):
+            message = await self.session.get(Message, message_id)
+            if message is None or message.conversation_id != state.conversation_id:
+                raise ValueError("ingested messages must belong to the ingestion conversation")
+            messages.append(message)
+            receipt = await self.session.get(MemoryIngestionReceipt, (state.id, message.id))
+            if receipt is None:
+                self.session.add(MemoryIngestionReceipt(state_id=state.id, message_id=message.id))
+        return messages
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
