@@ -186,7 +186,10 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             pass
         recalled = await _wait_for_sources(
             active,
-            {message.id: message.text or "" for message in (messages[0], messages[-1])},
+            {
+                message.id: (message.text or "", message.conversation_id)
+                for message in (messages[0], messages[-1])
+            },
         )
         assert all(item.authoritative is False for item in recalled.memories)
 
@@ -231,7 +234,10 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
         assert rebuilt.bank_id != initial_bank
         after_rebuild = await _wait_for_sources(
             active,
-            {message.id: message.text or "" for message in (messages[0], messages[-1])},
+            {
+                message.id: (message.text or "", message.conversation_id)
+                for message in (messages[0], messages[-1])
+            },
         )
         async with session_factory() as session:
             for item in after_rebuild.memories:
@@ -274,7 +280,12 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
         assert await processor.process_once(now=outage_time + timedelta(seconds=2)) is True
         caught_up = await _wait_for_sources(
             active,
-            {outage_message.id: outage_message.text or ""},
+            {
+                outage_message.id: (
+                    outage_message.text or "",
+                    outage_message.conversation_id,
+                )
+            },
         )
         assert any(
             item.provenance is not None and item.provenance.message_id == outage_message.id
@@ -290,12 +301,19 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
         await engine.dispose()
 
 
-async def _wait_for_sources(memory, expected: dict[uuid.UUID, str]):
+async def _wait_for_sources(memory, expected: dict[uuid.UUID, tuple[str, uuid.UUID]]):
     for _ in range(30):
         combined = []
         found: set[uuid.UUID] = set()
-        for message_id, query in expected.items():
-            recalled = await memory.recall(RecallQuery(text=query, max_tokens=1024))
+        for message_id, (query, conversation_id) in expected.items():
+            recalled = await memory.recall(
+                RecallQuery(
+                    text=query,
+                    max_tokens=1024,
+                    tags=(f"conversation:{conversation_id}",),
+                    tags_match="all_strict",
+                )
+            )
             combined.extend(recalled.memories)
             if any(
                 item.provenance is not None
