@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+memory = [
+  "hindsight-client==0.9.1",
+]
 test = [
   "aiosqlite>=0.20,<1",
   "pytest>=9,<10",
@@ -35,6 +38,7 @@ packages = ["src/elowyn"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
+  "hindsight: requires the pinned Hindsight 0.9.1 integration service",
   "postgres: requires a PostgreSQL test database",
 ]
 asyncio_mode = "auto"
