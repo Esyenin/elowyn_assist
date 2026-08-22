@@ -345,6 +345,20 @@ class MemoryPageService:
             raise LookupError("memory page was not found")
         return _page_view(page)
 
+    async def list_pages(self) -> tuple[MemoryPageView, ...]:
+        pages = (
+            (
+                await self.session.execute(
+                    select(MemoryPage).order_by(
+                        MemoryPage.page_type, MemoryPage.scope_key, MemoryPage.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return tuple(_page_view(page) for page in pages)
+
     async def observation_chain(self, page_id: uuid.UUID) -> tuple[ObservationView, ...]:
         observation_ids = (
             (
@@ -370,6 +384,7 @@ class MemoryPageService:
         )
         return {
             "observation_id": str(observation.id),
+            "claim_key": observation.claim_key,
             "statement": observation.statement,
             "category": observation.category.value,
             "status": observation.status.value,
@@ -418,6 +433,7 @@ def _page_view(page: MemoryPage) -> MemoryPageView:
     entries = tuple(
         MemoryPageEntry(
             observation_id=uuid.UUID(str(item["observation_id"])),
+            claim_key=str(item.get("claim_key", "")),
             statement=str(item["statement"]),
             category=_category(str(item["category"])),
             status=ObservationStatus(str(item["status"])),

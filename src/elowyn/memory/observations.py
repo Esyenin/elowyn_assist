@@ -73,6 +73,7 @@ class ObservationView:
 @dataclass(frozen=True)
 class MemoryPageEntry:
     observation_id: uuid.UUID
+    claim_key: str
     statement: str
     category: SemanticCategory
     status: ObservationStatus

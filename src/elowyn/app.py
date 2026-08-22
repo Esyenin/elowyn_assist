@@ -72,6 +72,7 @@ async def main() -> None:
         session_factory=SessionFactory,
         model=runtime_model,
         memory_ingestion_wakeup=memory_worker.wake if memory_worker else None,
+        memory_service=memory,
     )
     adapter = TelegramAdapter(allowed_user_id=allowed_user_id)
     dp.include_router(build_router(runtime.handle_message, adapter=adapter))
