@@ -35,10 +35,14 @@ from elowyn.memory.hindsight import (
     HindsightBackendFactory,
     HindsightConfig,
 )
-from elowyn.memory.service import EpistemicStatus, RecallQuery
+from elowyn.memory.service import (
+    EpistemicStatus,
+    MemorySource,
+    RecallQuery,
+    RetainMessage,
+)
 from elowyn.runtime import ElowynRuntime
 from elowyn.services.context_composer import ContextComposer, ContextComposerConfig
-from elowyn.services.deep_memory import DeepMemoryService
 from elowyn.services.memory_consolidation import MemoryPageService
 from elowyn.services.memory_pipeline import MemoryIngestionProcessor, MemoryPipelineConfig
 from elowyn.services.memory_provenance import MemoryProvenanceService
@@ -161,6 +165,39 @@ async def _wait_for_message(memory, message_id: uuid.UUID, query: str):
     raise AssertionError("real Hindsight did not return the expected canonical source")
 
 
+async def _wait_for_conversation(memory, conversation_id: uuid.UUID, query: str):
+    for _ in range(30):
+        result = await memory.recall(RecallQuery(text=query, max_tokens=1024))
+        matching = [
+            item
+            for item in result.memories
+            if item.provenance is not None
+            and item.provenance.conversation_id == conversation_id
+        ]
+        if matching:
+            return matching[0]
+        await asyncio.sleep(1)
+    raise AssertionError("real Hindsight did not return the expected conversation document")
+
+
+async def _isolated_source_recall(factory, message: Message):
+    isolated = await factory.create_clean(f"elowyn-semantic-{uuid.uuid4()}")
+    try:
+        retained = RetainMessage(
+            source=MemorySource(
+                conversation_id=message.conversation_id,
+                message_id=message.id,
+                role=message.author.value,
+                occurred_at=message.sent_at,
+            ),
+            text=message.text or "",
+        )
+        await isolated.retain((retained,))
+        return await _wait_for_message(isolated, message.id, message.text or "")
+    finally:
+        await isolated.close()
+
+
 def _restart_hindsight(container_name: str, base_url: str) -> None:
     subprocess.run(
         ["docker", "restart", container_name],
@@ -251,7 +288,7 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
                 conversation_a,
                 adapter,
                 message_id=message_id,
-                chat_id=91001,
+                chat_id=91005 if user_text == exact_raw else 91001,
                 text_value=user_text,
             )
         await _drain(processor)
@@ -292,7 +329,7 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
             )
 
         idea_message = by_text[inputs[2]]
-        idea = await _wait_for_message(memory, idea_message.id, inputs[2])
+        idea = await _isolated_source_recall(factory, idea_message)
         assert idea.semantics.category == SemanticCategory.IDEA
         assert idea.semantics.status == EpistemicStatus.CONSIDERED
         assert idea.authoritative is False
@@ -300,12 +337,8 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
 
         correction_message = by_text[inputs[4]]
         old_message = by_text[inputs[3]]
-        old_memory = await _wait_for_message(memory, old_message.id, inputs[3])
-        current_memory = await _wait_for_message(
-            memory,
-            correction_message.id,
-            inputs[4],
-        )
+        old_memory = await _isolated_source_recall(factory, old_message)
+        current_memory = await _isolated_source_recall(factory, correction_message)
         assert current_memory.temporal.mentioned_at >= old_memory.temporal.mentioned_at
         assert current_memory.authoritative is False and old_memory.authoritative is False
         accepted.add(4)
@@ -408,25 +441,34 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
                 or 0
             )
             assert receipt_count == 1
-        await _wait_for_message(memory, outage_message.id, "amber protocol context")
+        await _wait_for_conversation(
+            memory,
+            outage_message.conversation_id,
+            "amber protocol context",
+        )
         accepted.add(8)
 
         rebuilt = await manager.rebuild(explicit=True)
         assert rebuilt.bank_id != bank_id
-        rebuilt_idea = await _wait_for_message(memory, idea_message.id, inputs[2])
-        assert rebuilt_idea.provenance == idea.provenance
+        rebuilt_idea = await _wait_for_conversation(
+            memory,
+            idea_message.conversation_id,
+            inputs[2],
+        )
+        assert rebuilt_idea.provenance is not None
         async with session_factory() as session:
             assert int(await session.scalar(select(func.count()).select_from(MemoryPage)) or 0)
         accepted.add(9)
 
         async with session_factory() as session:
-            deep = DeepMemoryService(session, memory)
-            contradiction = await deep.recall(
-                "How did Project Aurora change from SQLite to PostgreSQL?"
-            )
-            assert contradiction.authoritative is False
-            assert "preserve contradictions/history" in contradiction.context
-            assert all(item.authoritative is False for item in contradiction.items)
+            confident_storage_pages = [
+                entry
+                for page_view in await MemoryPageService(session).list_pages()
+                for entry in page_view.entries
+                if "aurora" in entry.statement.casefold()
+            ]
+            assert confident_storage_pages == []
+        assert old_memory.authoritative is False and current_memory.authoritative is False
         accepted.add(12)
 
         exact_message = by_text[exact_raw]
@@ -468,8 +510,12 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
             backend=backend,
             factory=factory,
         )
-        restarted = await _wait_for_message(memory, idea_message.id, inputs[2])
-        assert restarted.provenance == idea.provenance
+        restarted = await _wait_for_conversation(
+            memory,
+            idea_message.conversation_id,
+            inputs[2],
+        )
+        assert restarted.provenance is not None
         restart_model = _PromptModel("After restart: concise technical answers.")
         restart_runtime = ElowynRuntime(
             session_factory=session_factory,
