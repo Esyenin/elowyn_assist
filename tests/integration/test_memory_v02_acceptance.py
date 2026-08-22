@@ -198,6 +198,21 @@ async def _isolated_source_recall(factory, message: Message):
         await isolated.close()
 
 
+async def _isolated_source_service(factory, message: Message):
+    isolated = await factory.create_clean(f"elowyn-exact-{uuid.uuid4()}")
+    retained = RetainMessage(
+        source=MemorySource(
+            conversation_id=message.conversation_id,
+            message_id=message.id,
+            role=message.author.value,
+            occurred_at=message.sent_at,
+        ),
+        text=message.text or "",
+    )
+    await isolated.retain((retained,))
+    return isolated
+
+
 def _restart_hindsight(container_name: str, base_url: str) -> None:
     subprocess.run(
         ["docker", "restart", container_name],
@@ -472,26 +487,30 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
         accepted.add(12)
 
         exact_message = by_text[exact_raw]
+        exact_memory = await _isolated_source_service(factory, exact_message)
         exact_model = _ExactSourceModel(exact_message_source_ref(exact_message), exact_raw)
         exact_runtime = ElowynRuntime(
             session_factory=session_factory,
             model=exact_model.model,
-            memory_service=memory,
+            memory_service=exact_memory,
         )
-        exact_response = await _turn(
-            exact_runtime,
-            adapter,
-            message_id=301,
-            chat_id=91002,
-            text_value="What exactly did I say about the blue notebook?",
-        )
-        assert exact_raw in exact_response
-        assert exact_model.calls == 3
-        assert "lookup_exact_memory_source" in exact_model.tools
-        assert not any(
-            tool.startswith(("create_", "update_", "revoke_"))
-            for tool in exact_model.tools
-        )
+        try:
+            exact_response = await _turn(
+                exact_runtime,
+                adapter,
+                message_id=301,
+                chat_id=91002,
+                text_value="What exactly did I say about the blue notebook?",
+            )
+            assert exact_raw in exact_response
+            assert exact_model.calls == 3
+            assert "lookup_exact_memory_source" in exact_model.tools
+            assert not any(
+                tool.startswith(("create_", "update_", "revoke_"))
+                for tool in exact_model.tools
+            )
+        finally:
+            await exact_memory.close()
         accepted.add(13)
 
         async with session_factory() as session:
