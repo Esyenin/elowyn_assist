@@ -166,7 +166,7 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
                     (conversations[0], "I prefer concise synthetic technical answers."),
                     (
                         conversations[0],
-                        "For synthetic architecture reviews, I prefer evidence-rich explanations.",
+                        "I prefer concise synthetic technical answers.",
                     ),
                     (conversations[1], "Maybe Elowyn could evaluate Neo4j later."),
                     (conversations[1], "Elowyn canonical state uses PostgreSQL."),
@@ -213,7 +213,7 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             observation = await consolidation.consolidate(
                 ObservationCandidate(
                     claim_key="integration.communication.concise",
-                    statement="User prefers concise, evidence-rich technical answers.",
+                    statement="User prefers concise synthetic technical answers.",
                     category=SemanticCategory.PREFERENCE,
                     evidence=evidence,
                     page_type=MemoryPageType.COMMUNICATION_PREFERENCES,
