@@ -59,6 +59,8 @@ def _prompt_text(messages) -> str:
             content = getattr(part, "content", None)
             if isinstance(content, str):
                 chunks.append(content)
+            elif content is not None:
+                chunks.append(str(content))
     return "\n".join(chunks)
 
 
