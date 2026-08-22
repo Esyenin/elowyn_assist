@@ -8,10 +8,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from elowyn.memory.semantics import SEMANTIC_SCHEMA_VERSION, classify_semantics
 from elowyn.memory.service import (
+    EpistemicStatus,
     MemoryBackendError,
     MemoryHealth,
+    MemorySemantics,
     MemorySource,
+    MemoryTemporal,
     RecalledMemory,
     RecallQuery,
     RecallResult,
@@ -19,11 +23,12 @@ from elowyn.memory.service import (
     ReflectQuery,
     RetainMessage,
     RetainResult,
+    SemanticCategory,
 )
 
 HINDSIGHT_API_VERSION = "0.9.1"
 HINDSIGHT_CLIENT_VERSION = "0.9.1"
-METADATA_SCHEMA_VERSION = "elowyn-memory-source-v1"
+METADATA_SCHEMA_VERSION = "elowyn-memory-source-v2"
 BACKEND_NAME = f"hindsight-{HINDSIGHT_API_VERSION}"
 _OPERATION_NAMESPACE = uuid.UUID("5a3b4e0f-53bd-47e9-b4d1-7aab32af6af6")
 
@@ -153,6 +158,8 @@ class HindsightAdapter:
             )
         except Exception as exc:
             raise MemoryBackendError("Hindsight recall failed") from exc
+        # Preserve Hindsight's semantic+temporal ranking. Elowyn exposes both
+        # timestamps and epistemic status, but does not declare a canonical winner.
         return RecallResult(memories=tuple(_map_recalled(item) for item in response.results))
 
     async def reflect(self, query: ReflectQuery) -> Reflection:
@@ -228,25 +235,33 @@ def _retain_item(message: RetainMessage) -> dict[str, Any]:
     role = source.role.strip().upper()
     role_tag = role.lower()
     timestamp = _require_aware(source.occurred_at)
+    semantics = message.semantics or classify_semantics(message.text)
     tags = sorted(
         {
             "elowyn",
             f"conversation:{source.conversation_id}",
             f"role:{role_tag}",
+            f"semantic:{semantics.category.value.lower()}",
+            f"status:{semantics.status.value.lower()}",
             *(f"topic:{tag.strip().lower()}" for tag in message.topic_tags if tag.strip()),
         }
     )
     return {
         "content": message.text,
         "timestamp": timestamp,
-        "context": f"Elowyn conversation message; role={role_tag}",
+        "context": _speaker_context(role),
         "document_id": document_id_for(source.conversation_id),
         "metadata": {
             "conversation_id": str(source.conversation_id),
             "message_id": str(source.message_id),
+            "source_ref": source.source_ref,
+            "document_id": source.document_id,
             "role": role,
             "timestamp": _iso_timestamp(timestamp),
             "extraction_schema_version": METADATA_SCHEMA_VERSION,
+            "semantic_schema_version": SEMANTIC_SCHEMA_VERSION,
+            "semantic_category": semantics.category.value,
+            "epistemic_status": semantics.status.value,
             "source_type": "conversation_message",
         },
         "tags": tags,
@@ -256,27 +271,100 @@ def _retain_item(message: RetainMessage) -> dict[str, Any]:
 
 def _map_recalled(item: Any) -> RecalledMemory:
     metadata = {str(key): str(value) for key, value in (item.metadata or {}).items()}
-    source = _source_from_metadata(metadata)
+    backend_kind = str(item.type) if item.type is not None else None
+    document_id = str(item.document_id) if item.document_id is not None else None
+    source = _source_from_metadata(metadata, document_id=document_id)
+    if backend_kind in {"world", "experience"} and source is None:
+        raise MemoryBackendError("Hindsight recall item has invalid Elowyn provenance")
+    occurred_start = _parse_datetime(getattr(item, "occurred_start", None))
+    occurred_end = _parse_datetime(getattr(item, "occurred_end", None))
+    mentioned_at = _parse_datetime(getattr(item, "mentioned_at", None))
+    if mentioned_at is None:
+        if source is None:
+            raise MemoryBackendError("Hindsight recall item has no source timestamp")
+        mentioned_at = source.occurred_at
+    semantics = _semantics_from_metadata(
+        metadata,
+        text=str(item.text),
+        backend_kind=backend_kind,
+        occurred_start=occurred_start,
+    )
     return RecalledMemory(
         backend_id=str(item.id),
         text=str(item.text),
-        kind=str(item.type) if item.type is not None else None,
-        document_id=str(item.document_id) if item.document_id is not None else None,
+        semantics=semantics,
+        backend_kind=backend_kind,
+        document_id=document_id,
         source=source,
+        temporal=MemoryTemporal(
+            mentioned_at=mentioned_at,
+            occurred_start=occurred_start,
+            occurred_end=occurred_end,
+        ),
         metadata=metadata,
         tags=tuple(str(tag) for tag in (item.tags or ())),
     )
 
 
-def _source_from_metadata(metadata: dict[str, str]) -> MemorySource | None:
+def _source_from_metadata(
+    metadata: dict[str, str], *, document_id: str | None
+) -> MemorySource | None:
     try:
-        return MemorySource(
+        source = MemorySource(
             conversation_id=uuid.UUID(metadata["conversation_id"]),
             message_id=uuid.UUID(metadata["message_id"]),
             role=metadata["role"],
-            occurred_at=datetime.fromisoformat(metadata["timestamp"]),
+            occurred_at=_require_aware(datetime.fromisoformat(metadata["timestamp"])),
         )
     except (KeyError, ValueError):
+        return None
+    if document_id != source.document_id:
+        return None
+    source_ref = metadata.get("source_ref")
+    if source_ref is not None and source_ref != source.source_ref:
+        return None
+    metadata_document_id = metadata.get("document_id")
+    if metadata_document_id is not None and metadata_document_id != source.document_id:
+        return None
+    return source
+
+
+def _semantics_from_metadata(
+    metadata: dict[str, str],
+    *,
+    text: str,
+    backend_kind: str | None,
+    occurred_start: datetime | None,
+) -> MemorySemantics:
+    try:
+        return MemorySemantics(
+            category=SemanticCategory(metadata["semantic_category"]),
+            status=EpistemicStatus(metadata["epistemic_status"]),
+        )
+    except (KeyError, ValueError):
+        return classify_semantics(
+            text,
+            backend_kind=backend_kind,
+            occurred_start=occurred_start,
+        )
+
+
+def _speaker_context(role: str) -> str:
+    if role == "USER":
+        return "The Elowyn user is speaking; first-person claims describe the user."
+    if role == "ASSISTANT":
+        return "The Elowyn assistant is speaking; first-person actions describe the agent."
+    return f"Elowyn conversation message; speaker role={role.lower()}."
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _require_aware(value)
+    try:
+        return _require_aware(datetime.fromisoformat(str(value)))
+    except ValueError:
         return None
 
 

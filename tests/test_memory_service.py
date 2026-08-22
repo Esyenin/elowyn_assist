@@ -118,6 +118,9 @@ async def test_adapter_maps_stable_source_metadata_and_retry_identity() -> None:
 
     assert first.operation_id == retry.operation_id == operation_id_for("elowyn-test", messages)
     assert len(client.retain_calls) == 2
+    assert client.retain_calls[0]["items"][0]["metadata"] == client.retain_calls[1][
+        "items"
+    ][0]["metadata"]
     call = client.retain_calls[0]
     assert call["retain_async"] is True
     assert call["operation_id"] == str(first.operation_id)
@@ -129,14 +132,21 @@ async def test_adapter_maps_stable_source_metadata_and_retry_identity() -> None:
         "conversation:10000000-0000-0000-0000-000000000001",
         "elowyn",
         "role:user",
+        "semantic:preference",
+        "status:preferred",
         "topic:preferences",
     ]
     assert item["metadata"] == {
         "conversation_id": "10000000-0000-0000-0000-000000000001",
         "message_id": "20000000-0000-0000-0000-000000000002",
+        "source_ref": "elowyn:message:20000000-0000-0000-0000-000000000002",
+        "document_id": "elowyn:conversation:10000000-0000-0000-0000-000000000001",
         "role": "USER",
         "timestamp": "2026-08-22T08:30:00Z",
         "extraction_schema_version": METADATA_SCHEMA_VERSION,
+        "semantic_schema_version": "elowyn-memory-semantics-v1",
+        "semantic_category": "PREFERENCE",
+        "epistemic_status": "PREFERRED",
         "source_type": "conversation_message",
     }
 

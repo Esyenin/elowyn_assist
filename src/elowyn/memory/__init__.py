@@ -1,4 +1,18 @@
 from elowyn.memory.hindsight import HindsightAdapter, HindsightConfig
-from elowyn.memory.service import MemoryService
+from elowyn.memory.service import (
+    EpistemicStatus,
+    MemoryProvenance,
+    MemorySemantics,
+    MemoryService,
+    SemanticCategory,
+)
 
-__all__ = ["HindsightAdapter", "HindsightConfig", "MemoryService"]
+__all__ = [
+    "EpistemicStatus",
+    "HindsightAdapter",
+    "HindsightConfig",
+    "MemoryProvenance",
+    "MemorySemantics",
+    "MemoryService",
+    "SemanticCategory",
+]

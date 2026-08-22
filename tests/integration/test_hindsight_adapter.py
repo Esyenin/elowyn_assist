@@ -7,8 +7,20 @@ from datetime import UTC, datetime
 
 import pytest
 
-from elowyn.memory.hindsight import HindsightAdapter, HindsightConfig, document_id_for
-from elowyn.memory.service import MemorySource, RecallQuery, ReflectQuery, RetainMessage
+from elowyn.memory.hindsight import (
+    METADATA_SCHEMA_VERSION,
+    HindsightAdapter,
+    HindsightConfig,
+    document_id_for,
+)
+from elowyn.memory.service import (
+    EpistemicStatus,
+    MemorySource,
+    RecallQuery,
+    ReflectQuery,
+    RetainMessage,
+    SemanticCategory,
+)
 
 pytestmark = pytest.mark.hindsight
 
@@ -53,7 +65,11 @@ async def test_real_hindsight_091_retain_retry_recall_reflect() -> None:
         matching = [item for item in recalled.memories if item.source == message.source]
         assert matching
         assert matching[0].document_id == document_id_for(conversation_id)
-        assert matching[0].metadata["extraction_schema_version"] == "elowyn-memory-source-v1"
+        assert matching[0].metadata["extraction_schema_version"] == METADATA_SCHEMA_VERSION
+        assert matching[0].kind == SemanticCategory.PREFERENCE
+        assert matching[0].semantics.status == EpistemicStatus.PREFERRED
+        assert matching[0].provenance is not None
+        assert matching[0].provenance.source_ref == f"elowyn:message:{message.source.message_id}"
         assert matching[0].authoritative is False
 
         reflected = await adapter.reflect(
