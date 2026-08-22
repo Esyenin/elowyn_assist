@@ -184,10 +184,10 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
 
         while await processor.process_once():
             pass
-        recalled = await _wait_for_sources(
+        recalled = await _wait_for_conversations(
             active,
             {
-                message.id: (message.text or "", message.conversation_id)
+                message.conversation_id: message.text or ""
                 for message in (messages[1], messages[-1])
             },
         )
@@ -232,10 +232,10 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
 
         rebuilt = await manager.rebuild(explicit=True)
         assert rebuilt.bank_id != initial_bank
-        after_rebuild = await _wait_for_sources(
+        after_rebuild = await _wait_for_conversations(
             active,
             {
-                message.id: (message.text or "", message.conversation_id)
+                message.conversation_id: message.text or ""
                 for message in (messages[1], messages[-1])
             },
         )
@@ -250,8 +250,11 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
             assert int(observation_count or 0)
             assert int(await session.scalar(select(func.count()).select_from(MemoryPage)) or 0)
 
+            outage_conversation = Conversation(transport=TransportType.INTERNAL)
+            session.add(outage_conversation)
+            await session.flush()
             outage_message = Message(
-                conversation_id=messages[-1].conversation_id,
+                conversation_id=outage_conversation.id,
                 author=MessageAuthor.USER,
                 text="The recovered backend must remember this synthetic backlog message.",
                 sent_at=datetime(2026, 8, 23, 9, 0, tzinfo=UTC),
@@ -323,3 +326,22 @@ async def _wait_for_sources(memory, expected: dict[uuid.UUID, tuple[str, uuid.UU
             return type(recalled)(memories=tuple(combined))
         await asyncio.sleep(1)
     raise AssertionError("Hindsight recall did not expose all retained canonical sources")
+
+
+async def _wait_for_conversations(memory, expected: dict[uuid.UUID, str]):
+    for _ in range(30):
+        combined = []
+        found: set[uuid.UUID] = set()
+        for conversation_id, query in expected.items():
+            recalled = await memory.recall(RecallQuery(text=query, max_tokens=1024))
+            combined.extend(recalled.memories)
+            if any(
+                item.provenance is not None
+                and item.provenance.conversation_id == conversation_id
+                for item in recalled.memories
+            ):
+                found.add(conversation_id)
+        if expected.keys() <= found:
+            return type(recalled)(memories=tuple(combined))
+        await asyncio.sleep(1)
+    raise AssertionError("Hindsight recall did not expose all retained conversation documents")

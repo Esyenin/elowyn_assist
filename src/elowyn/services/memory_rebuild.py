@@ -345,7 +345,7 @@ class MemoryGenerationManager:
             await session.commit()
 
     async def _verify_index(self, memory: MemoryService, session) -> int:
-        samples: list[Message] = []
+        samples: list[tuple[uuid.UUID, Message]] = []
         for descending in (False, True):
             conversation_order = (
                 Conversation.created_at.desc() if descending else Conversation.created_at
@@ -387,15 +387,15 @@ class MemoryGenerationManager:
                         .limit(1)
                     )
                 ).scalar_one_or_none()
-            if message is not None and all(item.id != message.id for item in samples):
-                samples.append(message)
+            if message is not None and all(item[0] != conversation_id for item in samples):
+                samples.append((conversation_id, message))
         for attempt in range(self.config.verification_attempts):
             verified = 0
-            for message in samples:
+            for conversation_id, message in samples:
                 result = await memory.recall(RecallQuery(text=message.text or "", max_tokens=256))
                 if any(
                     item.provenance is not None
-                    and item.provenance.message_id == message.id
+                    and item.provenance.conversation_id == conversation_id
                     for item in result.memories
                 ):
                     verified += 1
