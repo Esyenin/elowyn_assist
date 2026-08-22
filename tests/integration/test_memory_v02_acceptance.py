@@ -93,7 +93,7 @@ class _ExactSourceModel:
                 parts=[
                     ToolCallPart(
                         tool_name="recall_long_term_memory",
-                        args={"query": "What exactly did I say about the blue notebook?"},
+                        args={"query": self.raw_text},
                     )
                 ]
             )
