@@ -292,7 +292,7 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
             )
 
         idea_message = by_text[inputs[2]]
-        idea = await _wait_for_message(memory, idea_message.id, "Neo4j idea")
+        idea = await _wait_for_message(memory, idea_message.id, inputs[2])
         assert idea.semantics.category == SemanticCategory.IDEA
         assert idea.semantics.status == EpistemicStatus.CONSIDERED
         assert idea.authoritative is False
@@ -300,11 +300,11 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
 
         correction_message = by_text[inputs[4]]
         old_message = by_text[inputs[3]]
-        old_memory = await _wait_for_message(memory, old_message.id, "Aurora SQLite prototype")
+        old_memory = await _wait_for_message(memory, old_message.id, inputs[3])
         current_memory = await _wait_for_message(
             memory,
             correction_message.id,
-            "Aurora now PostgreSQL correction",
+            inputs[4],
         )
         assert current_memory.temporal.mentioned_at >= old_memory.temporal.mentioned_at
         assert current_memory.authoritative is False and old_memory.authoritative is False
@@ -413,7 +413,7 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
 
         rebuilt = await manager.rebuild(explicit=True)
         assert rebuilt.bank_id != bank_id
-        rebuilt_idea = await _wait_for_message(memory, idea_message.id, "Neo4j idea")
+        rebuilt_idea = await _wait_for_message(memory, idea_message.id, inputs[2])
         assert rebuilt_idea.provenance == idea.provenance
         async with session_factory() as session:
             assert int(await session.scalar(select(func.count()).select_from(MemoryPage)) or 0)
@@ -468,7 +468,7 @@ async def test_memory_v02_behavioral_acceptance_and_telegram_multisession() -> N
             backend=backend,
             factory=factory,
         )
-        restarted = await _wait_for_message(memory, idea_message.id, "Neo4j idea")
+        restarted = await _wait_for_message(memory, idea_message.id, inputs[2])
         assert restarted.provenance == idea.provenance
         restart_model = _PromptModel("After restart: concise technical answers.")
         restart_runtime = ElowynRuntime(
