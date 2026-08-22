@@ -60,13 +60,43 @@ PYTHONPATH=src pytest -q tests/test_schema_contract.py tests/test_world_state_se
 Полный suite:
 
 ```bash
-PYTHONPATH=src pytest -q
+pytest -q
 ```
 
-Conversation evals требуют `pydantic-ai`. PostgreSQL acceptance 1–9 требуют отдельную test DB:
+PostgreSQL acceptance 1–9 требуют отдельную test DB; при заданном URL полный suite запускает и их,
+и Pydantic AI conversation eval:
 
 ```bash
-TEST_DATABASE_URL=postgresql+asyncpg://... PYTHONPATH=src pytest -q -m postgres
+DATABASE_URL=postgresql+asyncpg://... alembic upgrade head
+TEST_DATABASE_URL=postgresql+asyncpg://... pytest -q
 ```
+
+CI поднимает PostgreSQL service автоматически, проверяет upgrade/downgrade/upgrade миграции, Ruff,
+mypy, compile, role permissions, concurrency, consistency stress, secret audit, recovery drill и все
+acceptance/eval tests.
+
+## PostgreSQL privilege model
+
+Deployment использует две отдельные роли:
+
+- migration/owner применяет Alembic и владеет schema objects;
+- runtime не является owner/superuser, не имеет DDL/DELETE/TRUNCATE и получает только необходимые
+  `SELECT`, `INSERT` и column-level `UPDATE` права.
+
+Provisioning и grants воспроизводятся командами `scripts/postgres_roles.py provision` и
+`scripts/postgres_roles.py grant-runtime`. Пароли передаются только через
+`ELOWYN_OWNER_PASSWORD`/`ELOWYN_RUNTIME_PASSWORD`; скрипт их не печатает. После каждой новой
+миграции runtime grants нужно применять повторно.
+
+## DB safety verification
+
+- Полный invariant audit: `docs/DATA_INVARIANT_AUDIT_V0_1.md`.
+- Read-only verifier: `elowyn.support.consistency.ConsistencyVerifier`.
+- Git history/worktree audit: `python scripts/secret_audit.py`.
+- Dump/restore drill: `scripts/recovery_drill.py`.
+
+Recovery drill отказывается работать с обычным `DATABASE_URL`: имя целевой БД должно начинаться с
+`elowyn_recovery_`, содержать test marker, а процесс обязан явно задать
+`ELOWYN_ALLOW_DESTRUCTIVE_TEST_DB=YES`.
 
 Acceptance contract находится в `ACCEPTANCE_V0_1.md`.

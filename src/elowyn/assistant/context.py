@@ -23,5 +23,6 @@ def build_turn_prompt(*, user_text: str, world_state: str, history: list[Message
 {user_text}
 
 Разрешай разговорные ссылки по World State и контексту. Если ссылка реально неоднозначна — уточни.
-Если изменение однозначно — примени его через domain tool и затем ответь по смыслу, без CRUD/ID отчёта.
+Если изменение однозначно — примени его через domain tool и затем ответь по смыслу,
+без CRUD/ID отчёта.
 """

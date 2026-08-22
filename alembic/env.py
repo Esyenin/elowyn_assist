@@ -4,12 +4,12 @@ import asyncio
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from elowyn.db.base import Base
+from alembic import context
 from elowyn.db import models  # noqa: F401
+from elowyn.db.base import Base
 
 config = context.config
 if config.config_file_name is not None:
@@ -45,6 +45,7 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        hide_parameters=True,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

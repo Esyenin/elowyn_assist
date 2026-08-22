@@ -48,12 +48,12 @@ def build_agent(
 
     @agent.tool_plain(sequential=True)
     async def query_world_state(search_text: str | None = None) -> str:
-        """Read current structured state. IDs in the result are internal and must not be shown to user."""
+        """Read current state; returned IDs are internal and must not be shown to the user."""
         return await query_service.render_for_llm(search_text=search_text)
 
     @agent.tool_plain(sequential=True)
     async def create_task(command: TaskCreate) -> dict[str, str]:
-        """Create an unambiguous Task. Only copy user-stated estimates here; use assess_task for AI estimates."""
+        """Create a Task; send AI-generated estimates through assess_task instead."""
         task = await service.create_task(command, action_context)
         return {"internal_entity_id": str(task.entity_id), "result": "task created"}
 
@@ -91,7 +91,10 @@ def build_agent(
     async def assess_project(command: ProjectAssessment) -> dict[str, str]:
         """Set Elowyn's own Project importance estimate with confidence and provenance."""
         project = await service.assess_project(command, evidence_source=action_context.source)
-        return {"internal_entity_id": str(project.entity_id), "result": "project assessment updated"}
+        return {
+            "internal_entity_id": str(project.entity_id),
+            "result": "project assessment updated",
+        }
 
     @agent.tool_plain(sequential=True)
     async def create_goal(command: GoalCreate) -> dict[str, str]:
@@ -125,7 +128,7 @@ def build_agent(
 
     @agent.tool_plain(sequential=True)
     async def record_decision(command: DecisionCreate) -> dict[str, str]:
-        """Record a significant choice; use supersedes_decision_id when revising an earlier Decision."""
+        """Record a significant choice, superseding an earlier Decision when applicable."""
         decision = await service.create_decision(command, action_context)
         return {"internal_entity_id": str(decision.entity_id), "result": "decision recorded"}
 
@@ -155,7 +158,7 @@ def build_agent(
 
     @agent.tool_plain(sequential=True)
     async def create_relation(command: EntityRelationCreate) -> str:
-        """Create an additional semantic relation using only the controlled RelationType catalog."""
+        """Create a semantic relation from the controlled RelationType catalog."""
         await service.create_relation(command, action_context)
         return "semantic relation present"
 
@@ -167,10 +170,10 @@ def build_agent(
 
     @agent.tool_plain(sequential=True)
     async def undo_last_change(entity_id: str | None = None) -> str:
-        """Undo the latest reversible state change by writing a new inverse Event; never delete history."""
+        """Undo the latest reversible change with a new inverse Event."""
         from uuid import UUID
 
-        event = await service.undo_last_change(
+        await service.undo_last_change(
             action_context,
             entity_id=UUID(entity_id) if entity_id else None,
         )

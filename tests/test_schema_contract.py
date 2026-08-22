@@ -1,16 +1,10 @@
-from pathlib import Path
-import sys
-
 import pytest
 from sqlalchemy import create_engine, inspect
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
+from elowyn.db import models  # noqa: F401
 from elowyn.db.base import Base
-from elowyn.db import models  # noqa: F401,E402
-from elowyn.domain.commands import TaskCreate  # noqa: E402
-from elowyn.domain.enums import DeadlineType  # noqa: E402
-
+from elowyn.domain.commands import TaskCreate
+from elowyn.domain.enums import DeadlineType
 
 EXPECTED_TABLES = {
     "entities",

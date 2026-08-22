@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
-from pathlib import Path
-import sys
 from uuid import uuid4
 
 import pytest
@@ -11,24 +9,21 @@ from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from elowyn.db.base import Base  # noqa: E402
-from elowyn.db.models import (  # noqa: E402
+from elowyn.db.base import Base
+from elowyn.db.models import (
     Decision,
     Entity,
     EntityRelation,
     Event,
     Operation,
-    ProjectGoalLink,
-    SuccessCriterion,
     Source,
     SourceDependency,
+    SuccessCriterion,
     Task,
     TaskDependency,
     TaskGoalLink,
 )
-from elowyn.domain.commands import (  # noqa: E402
+from elowyn.domain.commands import (
     DecisionAlternativeCreate,
     DecisionCreate,
     EntityRelationCreate,
@@ -46,7 +41,7 @@ from elowyn.domain.commands import (  # noqa: E402
     TaskDependencyCreate,
     TaskUpdate,
 )
-from elowyn.domain.enums import (  # noqa: E402
+from elowyn.domain.enums import (
     ActorType,
     DeadlineType,
     DecisionStatus,
@@ -55,11 +50,11 @@ from elowyn.domain.enums import (  # noqa: E402
     SuccessCriterionStatus,
     TransportType,
 )
-from elowyn.domain.errors import DomainValidationError, EntityNotFoundError  # noqa: E402
-from elowyn.domain.messages import IncomingMessage  # noqa: E402
-from elowyn.services.conversation import ConversationService  # noqa: E402
-from elowyn.services.query import WorldStateQueryService  # noqa: E402
-from elowyn.services.world_state import ActionContext, WorldStateService  # noqa: E402
+from elowyn.domain.errors import DomainValidationError, EntityNotFoundError
+from elowyn.domain.messages import IncomingMessage
+from elowyn.services.conversation import ConversationService
+from elowyn.services.query import WorldStateQueryService
+from elowyn.services.world_state import ActionContext, WorldStateService
 
 
 class _AsyncTransaction:
@@ -184,8 +179,14 @@ async def test_task_update_records_field_changes_and_message_provenance(session)
     current = await session.get(Task, task.entity_id)
     assert current.deadline_at.day == 28
     events = (
-        await session.execute(select(Event).where(Event.entity_id == task.entity_id).order_by(Event.created_at))
-    ).scalars().all()
+        (
+            await session.execute(
+                select(Event).where(Event.entity_id == task.entity_id).order_by(Event.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(events) == 2
     update_event = events[-1]
     assert update_event.source_id == update_turn.source.id
@@ -212,12 +213,16 @@ async def test_correction_and_undo_append_history_instead_of_rewriting_it(sessio
         ActionContext(ActorType.USER, correction.source),
     )
     correction_event = (
-        await session.execute(
-            select(Event)
-            .where(Event.entity_id == task.entity_id, Event.event_type == "TASK_UPDATED")
-            .order_by(Event.created_at.desc())
+        (
+            await session.execute(
+                select(Event)
+                .where(Event.entity_id == task.entity_id, Event.event_type == "TASK_UPDATED")
+                .order_by(Event.created_at.desc())
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
     undo_turn = await user_turn(session, "Верни как было до прошлого сообщения")
     undo_event = await service.undo_last_change(
@@ -228,8 +233,10 @@ async def test_correction_and_undo_append_history_instead_of_rewriting_it(sessio
     assert current.deadline_at.day == 30
     assert undo_event.reverses_event_id == correction_event.id
     all_events = (
-        await session.execute(select(Event).where(Event.entity_id == task.entity_id))
-    ).scalars().all()
+        (await session.execute(select(Event).where(Event.entity_id == task.entity_id)))
+        .scalars()
+        .all()
+    )
     assert correction_event in all_events
     assert undo_event in all_events
     assert len(all_events) == 3
@@ -328,7 +335,9 @@ async def test_strict_relations_and_controlled_semantic_relation(session) -> Non
 
 
 @pytest.mark.asyncio
-async def test_assistant_assessment_has_own_source_and_user_correction_replaces_provenance(session) -> None:
+async def test_assistant_assessment_has_own_source_and_user_correction_replaces_provenance(
+    session,
+) -> None:
     turn = await user_turn(session, "Нужно закончить тесты")
     service = WorldStateService(session)
     task = await service.create_task(
@@ -364,7 +373,9 @@ async def test_assistant_assessment_has_own_source_and_user_correction_replaces_
 
 
 @pytest.mark.asyncio
-async def test_invalid_reference_rolls_back_domain_action_without_event_or_operation(session) -> None:
+async def test_invalid_reference_rolls_back_domain_action_without_event_or_operation(
+    session,
+) -> None:
     turn = await user_turn(session, "Создай задачу в несуществующем проекте")
     service = WorldStateService(session)
     before_events = (await session.execute(select(Event))).scalars().all()
@@ -392,7 +403,9 @@ async def test_parent_and_dependency_cycles_are_rejected_without_domain_event(se
 
     events_before = len((await session.execute(select(Event))).scalars().all())
     with pytest.raises(DomainValidationError):
-        await service.update_task(TaskUpdate(entity_id=a.entity_id, parent_task_id=b.entity_id), ctx)
+        await service.update_task(
+            TaskUpdate(entity_id=a.entity_id, parent_task_id=b.entity_id), ctx
+        )
     assert len((await session.execute(select(Event))).scalars().all()) == events_before
 
     await service.add_task_dependency(
@@ -401,7 +414,8 @@ async def test_parent_and_dependency_cycles_are_rejected_without_domain_event(se
     events_before = len((await session.execute(select(Event))).scalars().all())
     with pytest.raises(DomainValidationError):
         await service.add_task_dependency(
-            TaskDependencyCreate(prerequisite_task_id=b.entity_id, dependent_task_id=a.entity_id), ctx
+            TaskDependencyCreate(prerequisite_task_id=b.entity_id, dependent_task_id=a.entity_id),
+            ctx,
         )
     assert len((await session.execute(select(Event))).scalars().all()) == events_before
 
@@ -420,7 +434,11 @@ async def test_query_snapshot_is_current_state_and_hides_superseded_decision(ses
         ctx,
     )
     task = await service.create_task(
-        TaskCreate(title="Подключить runtime", primary_project_id=project.entity_id, goal_ids=[goal.entity_id]),
+        TaskCreate(
+            title="Подключить runtime",
+            primary_project_id=project.entity_id,
+            goal_ids=[goal.entity_id],
+        ),
         ctx,
     )
     old = await service.create_decision(
@@ -536,7 +554,9 @@ async def test_success_criterion_assessment_user_correction_and_undo_keep_histor
         ActionContext(ActorType.USER, turn.source),
     )
     criterion = (
-        await session.execute(select(SuccessCriterion).where(SuccessCriterion.goal_id == goal.entity_id))
+        await session.execute(
+            select(SuccessCriterion).where(SuccessCriterion.goal_id == goal.entity_id)
+        )
     ).scalar_one()
 
     await service.assess_success_criterion(

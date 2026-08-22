@@ -4,14 +4,42 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: elowyn_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d elowyn_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ELOWYN_FAIL_ON_SKIP: "1"
+      ELOWYN_ADMIN_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+      ELOWYN_OWNER_PASSWORD: postgres
+      ELOWYN_RUNTIME_PASSWORD: postgres
+      DATABASE_URL: postgresql+asyncpg://elowyn_test_owner:postgres@localhost:5432/elowyn_test
+      TEST_DATABASE_URL: postgresql+asyncpg://elowyn_test_owner:postgres@localhost:5432/elowyn_test
+      TEST_RUNTIME_DATABASE_URL: postgresql+asyncpg://elowyn_test_runtime:postgres@localhost:5432/elowyn_test
+      ELOWYN_ALLOW_DESTRUCTIVE_TEST_DB: "YES"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -19,11 +47,53 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -e '.[test,dev]'
 
+      - name: Install PostgreSQL client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+
       - name: Ruff
         run: ruff check .
 
       - name: Compile
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests scripts
 
-      - name: Tests
+      - name: Type check
+        run: mypy src
+
+      - name: Provision migration owner and runtime roles
+        run: |
+          python scripts/postgres_roles.py provision \
+            --admin-url "$ELOWYN_ADMIN_DATABASE_URL" \
+            --target-url "postgresql+asyncpg://postgres:postgres@localhost:5432/elowyn_test" \
+            --database elowyn_test \
+            --owner-role elowyn_test_owner \
+            --runtime-role elowyn_test_runtime \
+            --test
+
+      - name: Verify migrations as owner role
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Apply least-privilege runtime grants
+        run: |
+          python scripts/postgres_roles.py grant-runtime \
+            --target-url "$DATABASE_URL" \
+            --database elowyn_test \
+            --owner-role elowyn_test_owner \
+            --runtime-role elowyn_test_runtime \
+            --test
+
+      - name: Audit Git history and worktree for secrets
+        run: python scripts/secret_audit.py
+
+      - name: Tests, acceptance, concurrency, permissions, and verifier stress
         run: pytest -q
+
+      - name: Destructive recovery drill on guarded ephemeral database
+        run: |
+          python scripts/recovery_drill.py \
+            --admin-url "$ELOWYN_ADMIN_DATABASE_URL" \
+            --target-url "postgresql+asyncpg://elowyn_test_owner:postgres@localhost:5432/elowyn_recovery_test"

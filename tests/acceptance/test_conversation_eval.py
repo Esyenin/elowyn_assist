@@ -7,24 +7,17 @@ specific evals can reuse the same cases later.
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic_ai import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-
-pydantic_ai = pytest.importorskip("pydantic_ai")
-
-from pydantic_ai import ModelResponse, TextPart, ToolCallPart  # noqa: E402
-from pydantic_ai.models.function import FunctionModel  # noqa: E402
-
-from elowyn.assistant.context import build_turn_prompt  # noqa: E402
-from elowyn.assistant.tools import build_agent  # noqa: E402
-from elowyn.domain.enums import ActorType  # noqa: E402
-from elowyn.services.world_state import ActionContext  # noqa: E402
+from elowyn.assistant.context import build_turn_prompt
+from elowyn.assistant.tools import build_agent
+from elowyn.domain.enums import ActorType
+from elowyn.services.world_state import ActionContext
 
 pytestmark = pytest.mark.asyncio
 

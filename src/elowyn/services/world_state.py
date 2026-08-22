@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from functools import wraps
 from enum import Enum
+from functools import wraps
 from typing import Any
 
-from sqlalchemy import select, update as sqlalchemy_update
+from sqlalchemy import select, text
+from sqlalchemy import update as sqlalchemy_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from elowyn.db.models import (
@@ -68,6 +70,8 @@ def atomic_domain_action(method):
 
     @wraps(method)
     async def wrapped(self, *args, **kwargs):
+        exclusive = method.__name__ == "undo_last_change" and kwargs.get("entity_id") is None
+        await self._lock_world_state(exclusive=exclusive)
         async with self.session.begin_nested():
             return await method(self, *args, **kwargs)
 
@@ -104,6 +108,61 @@ class WorldStateService:
     def __init__(self, session: AsyncSession):
         self.session = session
         self._last_event_at: datetime | None = None
+
+    def _uses_postgresql(self) -> bool:
+        get_bind = getattr(self.session, "get_bind", None)
+        if get_bind is not None:
+            return get_bind().dialect.name == "postgresql"
+        sync_session = getattr(self.session, "sync", None)
+        return sync_session is not None and sync_session.get_bind().dialect.name == "postgresql"
+
+    async def _lock_world_state(self, *, exclusive: bool) -> None:
+        """Coordinate global undo with concurrent domain actions for this transaction."""
+
+        if not self._uses_postgresql():
+            return
+        function = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+        await self.session.execute(text(f"SELECT {function}(5044031582654955025)"))
+
+    async def _lock_entities(self, entity_ids: list[uuid.UUID]) -> None:
+        """Lock identities in UUID order so concurrent multi-row actions cannot deadlock."""
+
+        ordered_ids = sorted(set(entity_ids))
+        if not ordered_ids or not self._uses_postgresql():
+            return
+        with self.session.no_autoflush:
+            await self.session.execute(
+                select(Entity)
+                .where(Entity.id.in_(ordered_ids))
+                .order_by(Entity.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+
+    async def _lock_typed_graph(
+        self,
+        model: type[Task] | type[Project] | type[Goal],
+        entity_type: EntityType,
+    ) -> None:
+        """Serialize graph mutations while locking rows in a stable global UUID order."""
+
+        if not self._uses_postgresql():
+            return
+        with self.session.no_autoflush:
+            await self.session.execute(
+                select(Entity)
+                .where(Entity.entity_type == entity_type)
+                .order_by(Entity.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            key = model.entity_id
+            await self.session.execute(
+                select(model)
+                .order_by(key)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
 
     async def _operation(self, ctx: ActionContext) -> Operation:
         if ctx.operation_id is not None:
@@ -163,9 +222,23 @@ class WorldStateService:
         return event
 
     async def _active_entity(
-        self, entity_id: uuid.UUID, expected_type: EntityType | None = None
+        self,
+        entity_id: uuid.UUID,
+        expected_type: EntityType | None = None,
+        *,
+        for_update: bool = False,
     ) -> Entity:
-        entity = await self.session.get(Entity, entity_id)
+        if for_update and self._uses_postgresql():
+            entity = (
+                await self.session.execute(
+                    select(Entity)
+                    .where(Entity.id == entity_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            entity = await self.session.get(Entity, entity_id)
         if (
             entity is None
             or entity.removed_at is not None
@@ -176,37 +249,91 @@ class WorldStateService:
             raise EntityNotFoundError(f"active {label} {entity_id} was not found")
         return entity
 
-    async def _active_task(self, task_id: uuid.UUID) -> Task:
-        await self._active_entity(task_id, EntityType.TASK)
-        task = await self.session.get(Task, task_id)
+    async def _active_task(self, task_id: uuid.UUID, *, for_update: bool = False) -> Task:
+        await self._active_entity(task_id, EntityType.TASK, for_update=for_update)
+        if for_update and self._uses_postgresql():
+            task = (
+                await self.session.execute(
+                    select(Task)
+                    .where(Task.entity_id == task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            task = await self.session.get(Task, task_id)
         if task is None:
             raise EntityNotFoundError(f"active TASK {task_id} was not found")
         return task
 
-    async def _active_project(self, project_id: uuid.UUID) -> Project:
-        await self._active_entity(project_id, EntityType.PROJECT)
-        project = await self.session.get(Project, project_id)
+    async def _active_project(self, project_id: uuid.UUID, *, for_update: bool = False) -> Project:
+        await self._active_entity(project_id, EntityType.PROJECT, for_update=for_update)
+        if for_update and self._uses_postgresql():
+            project = (
+                await self.session.execute(
+                    select(Project)
+                    .where(Project.entity_id == project_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            project = await self.session.get(Project, project_id)
         if project is None:
             raise EntityNotFoundError(f"active PROJECT {project_id} was not found")
         return project
 
-    async def _active_goal(self, goal_id: uuid.UUID) -> Goal:
-        await self._active_entity(goal_id, EntityType.GOAL)
-        goal = await self.session.get(Goal, goal_id)
+    async def _active_goal(self, goal_id: uuid.UUID, *, for_update: bool = False) -> Goal:
+        await self._active_entity(goal_id, EntityType.GOAL, for_update=for_update)
+        if for_update and self._uses_postgresql():
+            goal = (
+                await self.session.execute(
+                    select(Goal)
+                    .where(Goal.entity_id == goal_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            goal = await self.session.get(Goal, goal_id)
         if goal is None:
             raise EntityNotFoundError(f"active GOAL {goal_id} was not found")
         return goal
 
-    async def _success_criterion(self, criterion_id: uuid.UUID) -> SuccessCriterion:
-        criterion = await self.session.get(SuccessCriterion, criterion_id)
+    async def _success_criterion(
+        self, criterion_id: uuid.UUID, *, for_update: bool = False
+    ) -> SuccessCriterion:
+        if for_update and self._uses_postgresql():
+            criterion = (
+                await self.session.execute(
+                    select(SuccessCriterion)
+                    .where(SuccessCriterion.id == criterion_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            criterion = await self.session.get(SuccessCriterion, criterion_id)
         if criterion is None:
             raise EntityNotFoundError(f"success criterion {criterion_id} was not found")
         await self._active_goal(criterion.goal_id)
         return criterion
 
-    async def _active_decision(self, decision_id: uuid.UUID) -> Decision:
-        await self._active_entity(decision_id, EntityType.DECISION)
-        decision = await self.session.get(Decision, decision_id)
+    async def _active_decision(
+        self, decision_id: uuid.UUID, *, for_update: bool = False
+    ) -> Decision:
+        await self._active_entity(decision_id, EntityType.DECISION, for_update=for_update)
+        if for_update and self._uses_postgresql():
+            decision = (
+                await self.session.execute(
+                    select(Decision)
+                    .where(Decision.entity_id == decision_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            decision = await self.session.get(Decision, decision_id)
         if decision is None:
             raise EntityNotFoundError(f"active DECISION {decision_id} was not found")
         return decision
@@ -229,7 +356,9 @@ class WorldStateService:
         current_id: uuid.UUID | None = parent_id
         while current_id is not None:
             if current_id in seen:
-                raise DomainValidationError(f"{entity_type.value} parent hierarchy cannot contain a cycle")
+                raise DomainValidationError(
+                    f"{entity_type.value} parent hierarchy cannot contain a cycle"
+                )
             seen.add(current_id)
             await self._active_entity(current_id, entity_type)
             current = await self.session.get(model, current_id)
@@ -279,12 +408,16 @@ class WorldStateService:
             description=command.description,
             status=command.status,
             importance=command.importance,
-            importance_source_id=ctx.source.id if command.importance is not None and ctx.source else None,
+            importance_source_id=ctx.source.id
+            if command.importance is not None and ctx.source
+            else None,
             deadline_at=command.deadline_at,
             deadline_type=command.deadline_type,
             estimated_duration_minutes=command.estimated_duration_minutes,
             estimate_source_id=(
-                ctx.source.id if command.estimated_duration_minutes is not None and ctx.source else None
+                ctx.source.id
+                if command.estimated_duration_minutes is not None and ctx.source
+                else None
             ),
             parent_task_id=command.parent_task_id,
             primary_project_id=command.primary_project_id,
@@ -322,8 +455,10 @@ class WorldStateService:
 
     @atomic_domain_action
     async def update_task(self, command: TaskUpdate, ctx: ActionContext) -> Task:
-        task = await self._active_task(command.entity_id)
         fields = set(command.model_fields_set) - {"entity_id"}
+        if "parent_task_id" in fields:
+            await self._lock_typed_graph(Task, EntityType.TASK)
+        task = await self._active_task(command.entity_id, for_update=True)
 
         if "parent_task_id" in fields:
             await self._validate_parent_chain(
@@ -339,7 +474,11 @@ class WorldStateService:
         resulting_deadline = command.deadline_at if "deadline_at" in fields else task.deadline_at
         resulting_type = command.deadline_type if "deadline_type" in fields else task.deadline_type
         if resulting_type is not None and resulting_deadline is None:
-            if "deadline_at" in fields and command.deadline_at is None and "deadline_type" not in fields:
+            if (
+                "deadline_at" in fields
+                and command.deadline_at is None
+                and "deadline_type" not in fields
+            ):
                 fields.add("deadline_type")
                 command.deadline_type = None
             else:
@@ -446,7 +585,9 @@ class WorldStateService:
             description=command.description,
             status=command.status,
             importance=command.importance,
-            importance_source_id=ctx.source.id if command.importance is not None and ctx.source else None,
+            importance_source_id=ctx.source.id
+            if command.importance is not None and ctx.source
+            else None,
             target_date=command.target_date,
             target_date_type=command.target_date_type,
             parent_project_id=command.parent_project_id,
@@ -474,8 +615,10 @@ class WorldStateService:
 
     @atomic_domain_action
     async def update_project(self, command: ProjectUpdate, ctx: ActionContext) -> Project:
-        project = await self._active_project(command.entity_id)
         fields = set(command.model_fields_set) - {"entity_id"}
+        if "parent_project_id" in fields:
+            await self._lock_typed_graph(Project, EntityType.PROJECT)
+        project = await self._active_project(command.entity_id, for_update=True)
 
         if "parent_project_id" in fields:
             await self._validate_parent_chain(
@@ -491,7 +634,11 @@ class WorldStateService:
             command.target_date_type if "target_date_type" in fields else project.target_date_type
         )
         if resulting_type is not None and resulting_date is None:
-            if "target_date" in fields and command.target_date is None and "target_date_type" not in fields:
+            if (
+                "target_date" in fields
+                and command.target_date is None
+                and "target_date_type" not in fields
+            ):
                 fields.add("target_date_type")
                 command.target_date_type = None
             else:
@@ -552,10 +699,8 @@ class WorldStateService:
         return project
 
     @atomic_domain_action
-    async def cache_project_summary(
-        self, command: ProjectSummaryCacheUpdate
-    ) -> Project:
-        project = await self._active_project(command.entity_id)
+    async def cache_project_summary(self, command: ProjectSummaryCacheUpdate) -> Project:
+        project = await self._active_project(command.entity_id, for_update=True)
         project.current_summary = command.summary.strip()
         project.current_summary_updated_at = datetime.now(UTC)
         await self.session.flush()
@@ -593,7 +738,9 @@ class WorldStateService:
             description=command.description,
             status=command.status,
             importance=command.importance,
-            importance_source_id=ctx.source.id if command.importance is not None and ctx.source else None,
+            importance_source_id=ctx.source.id
+            if command.importance is not None and ctx.source
+            else None,
             target_date=command.target_date,
             target_date_type=command.target_date_type,
             parent_goal_id=command.parent_goal_id,
@@ -620,8 +767,10 @@ class WorldStateService:
 
     @atomic_domain_action
     async def update_goal(self, command: GoalUpdate, ctx: ActionContext) -> Goal:
-        goal = await self._active_goal(command.entity_id)
         fields = set(command.model_fields_set) - {"entity_id"}
+        if "parent_goal_id" in fields:
+            await self._lock_typed_graph(Goal, EntityType.GOAL)
+        goal = await self._active_goal(command.entity_id, for_update=True)
 
         if "parent_goal_id" in fields:
             await self._validate_parent_chain(
@@ -633,9 +782,15 @@ class WorldStateService:
             )
 
         resulting_date = command.target_date if "target_date" in fields else goal.target_date
-        resulting_type = command.target_date_type if "target_date_type" in fields else goal.target_date_type
+        resulting_type = (
+            command.target_date_type if "target_date_type" in fields else goal.target_date_type
+        )
         if resulting_type is not None and resulting_date is None:
-            if "target_date" in fields and command.target_date is None and "target_date_type" not in fields:
+            if (
+                "target_date" in fields
+                and command.target_date is None
+                and "target_date_type" not in fields
+            ):
                 fields.add("target_date_type")
                 command.target_date_type = None
             else:
@@ -716,7 +871,7 @@ class WorldStateService:
     async def update_success_criterion(
         self, command: SuccessCriterionUpdate, ctx: ActionContext
     ) -> SuccessCriterion:
-        criterion = await self._success_criterion(command.criterion_id)
+        criterion = await self._success_criterion(command.criterion_id, for_update=True)
         fields = set(command.model_fields_set) - {"criterion_id"}
         changed_fields: list[str] = []
         old_values: dict[str, Any] = {}
@@ -792,7 +947,9 @@ class WorldStateService:
         if command.supersedes_decision_id is not None:
             if command.status != DecisionStatus.ACTIVE:
                 raise DomainValidationError("a superseding decision must be ACTIVE")
-            superseded = await self._active_decision(command.supersedes_decision_id)
+            superseded = await self._active_decision(
+                command.supersedes_decision_id, for_update=True
+            )
             if superseded.status != DecisionStatus.ACTIVE:
                 raise DomainValidationError("only an ACTIVE decision can be superseded")
             superseded_entity = await self._active_entity(
@@ -847,7 +1004,7 @@ class WorldStateService:
 
     @atomic_domain_action
     async def revoke_decision(self, command: DecisionRevoke, ctx: ActionContext) -> Decision:
-        decision = await self._active_decision(command.entity_id)
+        decision = await self._active_decision(command.entity_id, for_update=True)
         if decision.status != DecisionStatus.ACTIVE:
             raise DomainValidationError("only an ACTIVE decision can be revoked")
         op = await self._operation(ctx)
@@ -868,6 +1025,7 @@ class WorldStateService:
 
     @atomic_domain_action
     async def link_task_goal(self, command: TaskGoalLinkCreate, ctx: ActionContext) -> TaskGoalLink:
+        await self._lock_entities([command.task_id, command.goal_id])
         await self._active_task(command.task_id)
         await self._active_goal(command.goal_id)
         existing = await self.session.get(TaskGoalLink, (command.task_id, command.goal_id))
@@ -896,6 +1054,7 @@ class WorldStateService:
     async def link_project_goal(
         self, command: ProjectGoalLinkCreate, ctx: ActionContext
     ) -> ProjectGoalLink:
+        await self._lock_entities([command.project_id, command.goal_id])
         await self._active_project(command.project_id)
         await self._active_goal(command.goal_id)
         existing = await self.session.get(ProjectGoalLink, (command.project_id, command.goal_id))
@@ -924,6 +1083,7 @@ class WorldStateService:
     async def add_task_dependency(
         self, command: TaskDependencyCreate, ctx: ActionContext
     ) -> TaskDependency:
+        await self._lock_typed_graph(Task, EntityType.TASK)
         await self._active_task(command.prerequisite_task_id)
         await self._active_task(command.dependent_task_id)
         existing = await self.session.get(
@@ -958,6 +1118,7 @@ class WorldStateService:
     async def create_relation(
         self, command: EntityRelationCreate, ctx: ActionContext
     ) -> EntityRelation:
+        await self._lock_entities([command.source_entity_id, command.target_entity_id])
         await self._active_entity(command.source_entity_id)
         await self._active_entity(command.target_entity_id)
         existing = (
@@ -1033,14 +1194,27 @@ class WorldStateService:
             EventType.GOAL_ACHIEVED,
             EventType.SUCCESS_CRITERION_UPDATED,
         ]
-        stmt = select(Event).where(
+        base_stmt = select(Event).where(
             Event.event_type.in_(undoable),
             Event.id.not_in(reversed_ids),
         )
-        if entity_id is not None:
-            stmt = stmt.where(Event.entity_id == entity_id)
+        if entity_id is None:
+            candidate = (
+                await self.session.execute(
+                    base_stmt.order_by(Event.created_at.desc(), Event.id.desc()).limit(1)
+                )
+            ).scalar_one_or_none()
+            if candidate is None or candidate.entity_id is None:
+                raise DomainValidationError("there is no reversible state change")
+            entity_id = candidate.entity_id
+
+        await self._active_entity(entity_id, for_update=True)
         target = (
-            await self.session.execute(stmt.order_by(Event.created_at.desc(), Event.id.desc()).limit(1))
+            await self.session.execute(
+                base_stmt.where(Event.entity_id == entity_id)
+                .order_by(Event.created_at.desc(), Event.id.desc())
+                .limit(1)
+            )
         ).scalar_one_or_none()
         if target is None or target.entity_id is None:
             raise DomainValidationError("there is no reversible state change")
@@ -1052,7 +1226,9 @@ class WorldStateService:
             change = target.changes[0]
             if change.get("field") != "success_criterion" or not change.get("criterion_id"):
                 raise DomainValidationError("success criterion event is not reversible")
-            criterion = await self._success_criterion(uuid.UUID(change["criterion_id"]))
+            criterion = await self._success_criterion(
+                uuid.UUID(change["criterion_id"]), for_update=True
+            )
             old_values = change.get("old")
             if not isinstance(old_values, dict):
                 raise DomainValidationError("success criterion event is not reversible")
@@ -1096,17 +1272,17 @@ class WorldStateService:
             return undo_event
 
         if target.event_type.value.startswith("TASK_"):
-            obj: Task | Project | Goal = await self._active_task(target.entity_id)
+            obj: Task | Project | Goal = await self._active_task(target.entity_id, for_update=True)
             enum_fields = {"status": TaskStatus, "deadline_type": DeadlineType}
             datetime_fields = {"deadline_at", "completed_at"}
             uuid_fields = {"parent_task_id", "primary_project_id"}
         elif target.event_type.value.startswith("PROJECT_"):
-            obj = await self._active_project(target.entity_id)
+            obj = await self._active_project(target.entity_id, for_update=True)
             enum_fields = {"status": ProjectStatus, "target_date_type": DeadlineType}
             datetime_fields = {"target_date", "completed_at"}
             uuid_fields = {"parent_project_id"}
         else:
-            obj = await self._active_goal(target.entity_id)
+            obj = await self._active_goal(target.entity_id, for_update=True)
             enum_fields = {"status": GoalStatus, "target_date_type": DeadlineType}
             datetime_fields = {"target_date", "achieved_at"}
             uuid_fields = {"parent_goal_id"}
@@ -1174,7 +1350,7 @@ class WorldStateService:
         field: str,
         value: Any,
         *,
-        enum_fields: dict[str, type[Enum]],
+        enum_fields: Mapping[str, type[Enum]],
         datetime_fields: set[str],
         uuid_fields: set[str],
     ) -> Any:
@@ -1209,8 +1385,6 @@ async def assistant_inference_source(
     session.add(source)
     await session.flush()
     if evidence_source is not None:
-        session.add(
-            SourceDependency(source_id=source.id, evidence_source_id=evidence_source.id)
-        )
+        session.add(SourceDependency(source_id=source.id, evidence_source_id=evidence_source.id))
         await session.flush()
     return source

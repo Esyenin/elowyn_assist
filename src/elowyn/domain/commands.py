@@ -31,7 +31,7 @@ class TaskCreate(BaseModel):
     prerequisite_task_ids: list[UUID] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def deadline_type_requires_date(self) -> "TaskCreate":
+    def deadline_type_requires_date(self) -> TaskCreate:
         if self.deadline_type is not None and self.deadline_at is None:
             raise ValueError("deadline_type requires deadline_at")
         return self
@@ -51,7 +51,7 @@ class TaskUpdate(BaseModel):
     auto_complete_from_children: bool | None = None
 
     @model_validator(mode="after")
-    def validate_update(self) -> "TaskUpdate":
+    def validate_update(self) -> TaskUpdate:
         changed = self.model_fields_set - {"entity_id"}
         if not changed:
             raise ValueError("at least one task field must be provided")
@@ -78,7 +78,7 @@ class ProjectCreate(BaseModel):
     goal_ids: list[UUID] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def target_type_requires_date(self) -> "ProjectCreate":
+    def target_type_requires_date(self) -> ProjectCreate:
         if self.target_date_type is not None and self.target_date is None:
             raise ValueError("target_date_type requires target_date")
         return self
@@ -95,7 +95,7 @@ class ProjectUpdate(BaseModel):
     parent_project_id: UUID | None = None
 
     @model_validator(mode="after")
-    def validate_update(self) -> "ProjectUpdate":
+    def validate_update(self) -> ProjectUpdate:
         changed = self.model_fields_set - {"entity_id"}
         if not changed:
             raise ValueError("at least one project field must be provided")
@@ -126,7 +126,7 @@ class GoalCreate(BaseModel):
     success_criteria: list[SuccessCriterionCreate] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def target_type_requires_date(self) -> "GoalCreate":
+    def target_type_requires_date(self) -> GoalCreate:
         if self.target_date_type is not None and self.target_date is None:
             raise ValueError("target_date_type requires target_date")
         return self
@@ -143,7 +143,7 @@ class GoalUpdate(BaseModel):
     parent_goal_id: UUID | None = None
 
     @model_validator(mode="after")
-    def validate_update(self) -> "GoalUpdate":
+    def validate_update(self) -> GoalUpdate:
         changed = self.model_fields_set - {"entity_id"}
         if not changed:
             raise ValueError("at least one goal field must be provided")
@@ -194,7 +194,7 @@ class TaskDependencyCreate(BaseModel):
     dependent_task_id: UUID
 
     @model_validator(mode="after")
-    def no_self_dependency(self) -> "TaskDependencyCreate":
+    def no_self_dependency(self) -> TaskDependencyCreate:
         if self.prerequisite_task_id == self.dependent_task_id:
             raise ValueError("task cannot depend on itself")
         return self
@@ -206,7 +206,7 @@ class EntityRelationCreate(BaseModel):
     relation_type: RelationType
 
     @model_validator(mode="after")
-    def no_self_relation(self) -> "EntityRelationCreate":
+    def no_self_relation(self) -> EntityRelationCreate:
         if self.source_entity_id == self.target_entity_id:
             raise ValueError("entity cannot relate to itself")
         return self
@@ -220,12 +220,13 @@ class TaskAssessment(BaseModel):
     reason_summary: str = Field(min_length=1, max_length=2000)
 
     @model_validator(mode="after")
-    def at_least_one_assessment(self) -> "TaskAssessment":
-        if "importance" not in self.model_fields_set and "estimated_duration_minutes" not in self.model_fields_set:
+    def at_least_one_assessment(self) -> TaskAssessment:
+        if (
+            "importance" not in self.model_fields_set
+            and "estimated_duration_minutes" not in self.model_fields_set
+        ):
             raise ValueError("importance or estimated_duration_minutes must be provided")
         return self
-
-
 
 
 class ProjectSummaryCacheUpdate(BaseModel):
@@ -255,7 +256,7 @@ class SuccessCriterionUpdate(BaseModel):
     evaluation_summary: str | None = None
 
     @model_validator(mode="after")
-    def validate_update(self) -> "SuccessCriterionUpdate":
+    def validate_update(self) -> SuccessCriterionUpdate:
         changed = self.model_fields_set - {"criterion_id"}
         if not changed:
             raise ValueError("at least one success criterion field must be provided")
@@ -282,7 +283,7 @@ class EntityRelationInference(BaseModel):
     reason_summary: str = Field(min_length=1, max_length=2000)
 
     @model_validator(mode="after")
-    def no_self_relation(self) -> "EntityRelationInference":
+    def no_self_relation(self) -> EntityRelationInference:
         if self.source_entity_id == self.target_entity_id:
             raise ValueError("entity cannot relate to itself")
         return self

@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import false, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from elowyn.db.models import (
@@ -16,8 +16,8 @@ from elowyn.db.models import (
     EntityRelation,
     Goal,
     Project,
-    SuccessCriterion,
     ProjectGoalLink,
+    SuccessCriterion,
     Task,
     TaskDependency,
     TaskGoalLink,
@@ -45,30 +45,48 @@ class WorldStateQueryService:
     async def snapshot(self, *, search_text: str | None = None) -> dict[str, Any]:
         active = self._active_entity_clause()
         tasks = (
-            await self.session.execute(
-                select(Task).join(Entity, Entity.id == Task.entity_id).where(*active)
+            (
+                await self.session.execute(
+                    select(Task).join(Entity, Entity.id == Task.entity_id).where(*active)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         projects = (
-            await self.session.execute(
-                select(Project).join(Entity, Entity.id == Project.entity_id).where(*active)
+            (
+                await self.session.execute(
+                    select(Project).join(Entity, Entity.id == Project.entity_id).where(*active)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         goals = (
-            await self.session.execute(
-                select(Goal).join(Entity, Entity.id == Goal.entity_id).where(*active)
+            (
+                await self.session.execute(
+                    select(Goal).join(Entity, Entity.id == Goal.entity_id).where(*active)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         decisions = (
-            await self.session.execute(
-                select(Decision).join(Entity, Entity.id == Decision.entity_id).where(*active)
+            (
+                await self.session.execute(
+                    select(Decision).join(Entity, Entity.id == Decision.entity_id).where(*active)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         needle = search_text.casefold().strip() if search_text else None
         if needle:
             tasks = [t for t in tasks if needle in f"{t.title} {t.description or ''}".casefold()]
-            projects = [p for p in projects if needle in f"{p.name} {p.description or ''}".casefold()]
+            projects = [
+                p for p in projects if needle in f"{p.name} {p.description or ''}".casefold()
+            ]
             goals = [g for g in goals if needle in f"{g.title} {g.description or ''}".casefold()]
             decisions = [
                 d
@@ -83,19 +101,29 @@ class WorldStateQueryService:
         visible_ids = task_ids | project_ids | goal_ids | decision_ids
 
         success_criteria = (
-            await self.session.execute(
-                select(SuccessCriterion).where(
-                    SuccessCriterion.goal_id.in_(goal_ids) if goal_ids else False
+            (
+                await self.session.execute(
+                    select(SuccessCriterion).where(
+                        SuccessCriterion.goal_id.in_(goal_ids) if goal_ids else false()
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         decision_alternatives = (
-            await self.session.execute(
-                select(DecisionAlternative).where(
-                    DecisionAlternative.decision_id.in_(decision_ids) if decision_ids else False
+            (
+                await self.session.execute(
+                    select(DecisionAlternative).where(
+                        DecisionAlternative.decision_id.in_(decision_ids)
+                        if decision_ids
+                        else false()
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         criteria_by_goal: dict[UUID, list[SuccessCriterion]] = {}
         for criterion in success_criteria:
@@ -105,37 +133,57 @@ class WorldStateQueryService:
             alternatives_by_decision.setdefault(alternative.decision_id, []).append(alternative)
 
         task_goal_links = (
-            await self.session.execute(
-                select(TaskGoalLink).where(
-                    TaskGoalLink.task_id.in_(task_ids) if task_ids else False,
-                    TaskGoalLink.goal_id.in_(goal_ids) if goal_ids else False,
+            (
+                await self.session.execute(
+                    select(TaskGoalLink).where(
+                        TaskGoalLink.task_id.in_(task_ids) if task_ids else false(),
+                        TaskGoalLink.goal_id.in_(goal_ids) if goal_ids else false(),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         project_goal_links = (
-            await self.session.execute(
-                select(ProjectGoalLink).where(
-                    ProjectGoalLink.project_id.in_(project_ids) if project_ids else False,
-                    ProjectGoalLink.goal_id.in_(goal_ids) if goal_ids else False,
+            (
+                await self.session.execute(
+                    select(ProjectGoalLink).where(
+                        ProjectGoalLink.project_id.in_(project_ids) if project_ids else false(),
+                        ProjectGoalLink.goal_id.in_(goal_ids) if goal_ids else false(),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         dependencies = (
-            await self.session.execute(
-                select(TaskDependency).where(
-                    TaskDependency.prerequisite_task_id.in_(task_ids) if task_ids else False,
-                    TaskDependency.dependent_task_id.in_(task_ids) if task_ids else False,
+            (
+                await self.session.execute(
+                    select(TaskDependency).where(
+                        TaskDependency.prerequisite_task_id.in_(task_ids) if task_ids else false(),
+                        TaskDependency.dependent_task_id.in_(task_ids) if task_ids else false(),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         semantic_relations = (
-            await self.session.execute(
-                select(EntityRelation).where(
-                    EntityRelation.source_entity_id.in_(visible_ids) if visible_ids else False,
-                    EntityRelation.target_entity_id.in_(visible_ids) if visible_ids else False,
+            (
+                await self.session.execute(
+                    select(EntityRelation).where(
+                        EntityRelation.source_entity_id.in_(visible_ids)
+                        if visible_ids
+                        else false(),
+                        EntityRelation.target_entity_id.in_(visible_ids)
+                        if visible_ids
+                        else false(),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         return {
             "tasks": [

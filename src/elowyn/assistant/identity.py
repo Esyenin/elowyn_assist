@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "identity_v0_1.md"
 
 

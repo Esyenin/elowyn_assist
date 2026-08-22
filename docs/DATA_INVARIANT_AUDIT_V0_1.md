@@ -1,0 +1,33 @@
+# Elowyn v0.1 — data invariant audit
+
+This audit separates validation performed by input models, Core services, and PostgreSQL. Complex
+graph and cross-table lifecycle rules deliberately remain in Core and are checked independently by
+the read-only consistency verifier; PostgreSQL constraints are used only for structural facts it can
+enforce locally and deterministically.
+
+| Table | Domain invariants | Pydantic validation | Core validation | PostgreSQL guarantees | Remaining / verifier-owned gap |
+|---|---|---|---|---|---|
+| `entities` | One typed identity; no self-supersede; removed/superseded objects are inactive | Entity IDs/types are not supplied by create commands | Creates the matching typed row; `_active_entity` rejects removed, superseded, or wrong-type identity | PK; enum CHECK; self-FK; self-supersede CHECK | Cross-table entity/type match and successor-chain validity require verifier/Core |
+| `conversations` | Unique transport conversation; external ID is not blank | `IncomingMessage` is typed but is a dataclass | Conversation ingestion performs get-or-create | PK; transport enum; `(transport, external_id)` UNIQUE; nonblank ID CHECK | A NULL external ID remains allowed for internal conversations |
+| `messages` | Belongs to a conversation; contains text or payload; external message is idempotent per conversation | Transport adapter builds typed `IncomingMessage` | Ingestion normalizes timezone and reuses duplicate external messages | PK; conversation FK; per-conversation UNIQUE; nonblank external ID and content CHECKs | Shape of transport-specific JSON remains adapter-owned |
+| `sources` | A user message has one source; assistant inference records confidence and reason | Assessment commands constrain confidence 0..1 and nonblank reason | Inference factory creates evidence provenance; ingestion creates/reuses user source | PK; message FK and UNIQUE; confidence CHECK; source enum; user-message and inference-shape CHECKs | Evidence requirement is cross-table and checked by verifier |
+| `source_dependencies` | Inference depends on distinct evidence | Inference tools accept an evidence source | Factory inserts dependency after source | Composite PK; two FKs; not-self CHECK | Semantic source types and inference evidence completeness require verifier |
+| `operations` | Groups events from one actor action/turn | `ActionContext` types actor/source/operation UUID | Reuses explicit operation ID within a turn | PK; actor enum; source FK | Actor/source semantic agreement is policy, not a local structural fact |
+| `events` | Append-only history; operation is mandatory; undo points to another event | Event payload is internal, not user supplied | Service emits field-level old/new and inverse undo events | PK; mandatory operation FK; entity/source/reverse FKs; event enum; non-self reverse CHECK | JSON change semantics and reverse compatibility require verifier; append-only is enforced by runtime grants |
+| `tasks` | TASK identity; nonblank title; valid importance/estimate; valid deadline pair; no self-parent; DONE timestamp agreement | Create/update validate text, ranges, enum, deadline input | References, parent cycles, lifecycle timestamps and provenance are validated/set | PK/FKs; enum CHECKs; range CHECKs; title, self-parent, deadline and completion CHECKs | Entity/type match and multi-row parent cycles require verifier/Core |
+| `projects` | PROJECT identity; nonblank name; target pair; no self-parent; completion and summary-cache agreement | Create/update validate text, range, enum and target input | References/cycles; lifecycle timestamp; derived cache invalidation | PK/FKs; enum/range/name/self-parent/target/completion/cache CHECKs | Entity/type match and multi-row cycles require verifier/Core |
+| `goals` | GOAL identity; nonblank title; target pair; no self-parent; achievement timestamp agreement | Create/update validate text, range, enum and target input | References/cycles and lifecycle timestamp | PK/FKs; enum/range/title/self-parent/target/achievement CHECKs | Entity/type match and multi-row cycles require verifier/Core |
+| `success_criteria` | Belongs to Goal; nonblank description; bounded confidence; evaluation provenance | Create/update/assessment validate description, status, confidence and summaries | Active Goal required; updates/events/undo preserve provenance | PK; Goal/source FKs; enum; confidence and description CHECKs | Status/evaluation semantic agreement and inference dependency require verifier |
+| `decisions` | DECISION identity; nonblank title/choice; active decision has at most one successor; no self-supersede | Create validates title/choice/status/UUID | Only ACTIVE decisions can be superseded/revoked; old Decision and Entity updated atomically | PK/FKs; enum; text/self CHECKs; UNIQUE successor per predecessor | Entity/type and full supersede-chain agreement require verifier/Core |
+| `decision_alternatives` | Belongs to Decision; nonblank option | Alternative command requires nonempty option | Created only with its Decision | PK; Decision FK; nonblank CHECK | Duplicate options are allowed because wording-equivalent alternatives are domain interpretation |
+| `task_goal_links` | Existing Task and Goal; no duplicate pair; provenance retained | UUID command fields | Both endpoints must be active | Composite PK; endpoint/source FKs; confidence CHECK | Endpoint entity/type and source semantics checked by verifier |
+| `project_goal_links` | Existing Project and Goal; no duplicate pair; provenance retained | UUID command fields | Both endpoints must be active | Composite PK; endpoint/source FKs; confidence CHECK | Endpoint entity/type and source semantics checked by verifier |
+| `task_dependencies` | Existing distinct Tasks; unique directed edge; acyclic graph | Rejects self-dependency | Active endpoints and graph-cycle detection | Composite PK; endpoint/source FKs; confidence and not-self CHECKs | Multi-row cycle detection remains Core/verifier-owned |
+| `entity_relations` | Existing distinct entities; controlled relation type; unique directed typed edge | Enum and no-self validation | Active endpoints; duplicate creation is idempotent | PK/FKs; relation enum; confidence/not-self CHECKs; triple UNIQUE | Endpoint activity/type and provenance semantics checked by verifier |
+
+## Constraint policy
+
+Database constraints intentionally do not duplicate graph traversal, provenance interpretation, or
+cross-table entity/type logic. Those rules cannot be expressed as stable row-local CHECK constraints
+in PostgreSQL. Runtime roles receive no DDL or DELETE rights, while history tables receive only
+`SELECT`/`INSERT`, providing an independent append-only boundary for application credentials.

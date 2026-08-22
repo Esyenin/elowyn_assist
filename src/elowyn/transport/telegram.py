@@ -11,7 +11,7 @@ class TelegramAdapter:
         self.allowed_user_id = allowed_user_id
 
     def check_user(self, telegram_user_id: int) -> bool:
-        return self.allowed_user_id is None or telegram_user_id == self.allowed_user_id
+        return self.allowed_user_id is not None and telegram_user_id == self.allowed_user_id
 
     def to_incoming(self, message) -> IncomingMessage:
         return IncomingMessage(

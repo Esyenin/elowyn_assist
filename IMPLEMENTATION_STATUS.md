@@ -1,11 +1,12 @@
-# Implementation status — 2026-08-22
+# Implementation and DB safety status — 2026-08-22
 
 ## Текущий статус
 
-Код доведён до **v0.1 acceptance candidate**. Локальные schema/domain contract tests зелёные.
-Полная версия ещё не помечается как acceptance-certified только потому, что в текущей среде нет
-PostgreSQL runtime/dependencies (`asyncpg`, `pydantic-ai`, `aiogram`) и поэтому end-to-end suite
-физически не может быть исполнен здесь.
+Функциональный contract v0.1 и DB safety phases 1–6 подтверждены локально на реальном PostgreSQL.
+Локальный deterministic E2E проходит через `TelegramAdapter → Pydantic AI FunctionModel → Core →`
+least-privilege runtime role → PostgreSQL. Этап в целом **ещё не объявлен полностью успешным**:
+внешний Telegram/provider E2E не запускался из-за отсутствия provider API key, Telegram token и
+allowed user id; исправленный удалённый GitHub Actions run также появится только после commit/push.
 
 ## Реализовано
 
@@ -39,6 +40,28 @@ PostgreSQL runtime/dependencies (`asyncpg`, `pydantic-ai`, `aiogram`) и поэ�
   (deny-by-default).
 - Conversation eval contract для ambiguity/no-CRUD UX.
 - PostgreSQL acceptance suite для сценариев 1–9.
+- GitHub Actions PostgreSQL service, migration round-trip, Ruff, mypy, compile и полный pytest suite.
+- GitHub Actions `checkout/setup-python` обновлены до v7 (Node 24); у workflow минимальные
+  `contents: read` permissions.
+- Alembic `0002_structural_invariants`: row-local DB constraints для непустых обязательных полей,
+  date/type и lifecycle timestamp pairs, self-links, единственного Decision successor, единственного
+  Source на user Message и единственного undo на Event.
+- Direct-SQL negative tests доказывают, что PostgreSQL самостоятельно отвергает structural
+  corruption.
+- PostgreSQL `SELECT FOR UPDATE` для конфликтующих state mutations; стабильный UUID lock ordering,
+  shared/exclusive advisory lock для точного global undo и сериализация typed graph edits без
+  глобальной смены isolation level.
+- Раздельные migration owner/runtime роли; runtime не имеет DDL, TRUNCATE, DELETE и mutation rights
+  на `events`, `operations`, `sources`.
+- Guarded custom-format `pg_dump → DROP только recovery test DB → CREATE → pg_restore` drill с
+  полным deterministic state/history digest и post-restore update/correction/undo.
+- Read-only consistency verifier для entity/type, relations, Event/Operation, Message/Source,
+  supersede и inference provenance; verifier чист после 1000 domain mutations.
+- Git history/worktree secret audit и synthetic-canary tests для prompt/log/exception leakage;
+  SQL bind parameters скрыты.
+- Recovery database защищена test-name/env/server checks и постоянным sentinel comment; runtime и
+  owner роли очищаются от memberships, имеют `NOINHERIT`/`NOBYPASSRLS`, runtime лишён `TEMP`.
+- CI получает полную Git history и принудительно падает при любом pytest skip/xfail/xpass.
 
 ## Исправленные проблемы исходного scaffold
 
@@ -53,30 +76,79 @@ PostgreSQL runtime/dependencies (`asyncpg`, `pydantic-ai`, `aiogram`) и поэ�
    чего latest/undo мог зависеть от случайного UUID.
 9. Повтор Telegram update после provider failure мог быть ошибочно проигнорирован навсегда.
 10. Пустой Telegram allow-list фактически открывал personal bot всем пользователям.
+11. Два concurrent Task update создавали lost update и ложный `Event.old`.
+12. Concurrent update + undo мог отменить не последнее фактическое состояние и записать ложную
+    историю.
+13. Два Decision supersede и duplicate relation creation завершались constraint error вместо
+    корректной сериализации/idempotency.
+14. Одновременные parent/dependency изменения могли создать цикл, хотя оба Core-check проходили.
+15. Первичная передача БД migration owner-роли не передавала владение оставшейся
+    `alembic_version`.
+16. Locking `events` для undo требовал UPDATE privilege и конфликтовал с append-only runtime model.
+17. `TelegramAdapter` отдельно от production entrypoint оставался allow-all при пустой настройке.
+18. Safety fixture оставлял setup-строки direct-SQL negative tests между модулями.
+19. Global undo имел TOCTOU между выбором последнего Event и блокировкой его Entity при update
+    другой Entity.
+20. Recovery drill мог удалить существующую test-named БД без постоянного sentinel и не сверял
+    server admin/target URL.
+21. Runtime роль могла сохранить inherited memberships и получать `TEMP` через `PUBLIC`.
+22. Consistency verifier мог autoflush чужие pending ORM changes вызывающей сессии.
+23. Shallow checkout и обычный pytest exit code позволяли CI не доказать full-history scan и
+    скрыть skips.
 
 ## Проверено в текущем окружении
 
-- `PYTHONPATH=src pytest -q`: **17 passed, 2 skipped**.
-- `python -m compileall -q src tests`: **OK**.
-- Schema/Alembic contract tests: **OK**.
-- 2 skipped suites:
-  - PostgreSQL acceptance 1–9: нужен `TEST_DATABASE_URL` + `asyncpg` + `pydantic-ai`;
-  - conversation eval: нужен `pydantic-ai`.
-- `aiogram`, `pydantic-ai`, `asyncpg`, `ruff`, `mypy` отсутствуют в текущем sandbox; сеть для
-  установки зависимостей недоступна.
+- PostgreSQL: **18.3**, отдельный acceptance cluster на `127.0.0.1:55433`.
+- `alembic downgrade base && alembic upgrade head`: **OK** на PostgreSQL.
+- Acceptance 1–9: **9 passed**.
+- Pydantic AI conversation eval: **3 passed**.
+- Полный `pytest -ra` с owner/runtime URLs и `ELOWYN_FAIL_ON_SKIP=1`: **58 passed**, без skip.
+- Concurrency suite: два update, update+undo, два supersede, duplicate relation, concurrent
+  parent/dependency cycles и deadlock-sensitive opposite lock order — **OK**.
+- Runtime permission suite и deterministic adapter/Pydantic/Core/runtime PostgreSQL chain — **OK**.
+- Consistency verifier после **1000 mutations** — **OK**.
+- Direct-SQL corruption suite — **OK**.
+- Custom-format dump/restore digest и post-restore mutations — **OK**.
+- Git history/worktree secret audit — **OK**, неплейсхолдерных секретов не найдено.
+- `ruff check .`: **OK**.
+- `mypy src`: **OK**.
+- `python -m compileall -q src tests scripts`: **OK**.
+- Установленные ключевые зависимости: aiogram 3.30.0, asyncpg 0.31.0, Pydantic AI 2.33.0,
+  SQLAlchemy 2.0.52, Alembic 1.19.1.
+- Предыдущий удалённый CI run `4560e7d` был красным на старом workflow; исправленный workflow
+  полностью воспроизведён локально, но ещё не публиковался.
 
-## Что остаётся до формального «v0.1 done»
+## Что ещё не подтверждено
 
-1. В окружении с зависимостями поднять PostgreSQL, выполнить `alembic upgrade head`.
-2. Запустить `TEST_DATABASE_URL=... PYTHONPATH=src pytest -q -m postgres` и добиться 9/9 green.
-3. Запустить conversation eval с Pydantic AI; затем хотя бы smoke-turn с выбранным реальным provider.
-4. Запустить `ruff`/`mypy` после установки dev dependencies и исправить только реальные замечания.
+- Настоящий Telegram network → hosted Pydantic AI provider E2E: credentials в окружении отсутствуют.
+- Secret Scanning / Push Protection: `gh` отсутствует, unauthenticated GitHub API эту настройку не
+  раскрывает.
+- Исправленный удалённый GitHub Actions workflow ещё не опубликован/запущен.
 
-До выполнения этих пунктов код является implementation-complete candidate, но не утверждается как
-полностью прошедшая acceptance v0.1.
+## Полученные safety guarantees
+
+- Runtime credentials не позволяют DDL/TRUNCATE/DELETE и не позволяют UPDATE/DELETE history.
+- Конфликтующие изменения одного объекта сериализуются до чтения old state; Event old/new,
+  Operation и Source соответствуют реально применённому порядку.
+- Structural corruption отклоняется DB constraints, а cross-table/graph corruption обнаруживается
+  read-only verifier.
+- Dump/restore сохраняет полное состояние и историю побайтно-детерминированно на уровне canonical
+  digest; восстановленная БД остаётся записываемой через domain service.
+- Recovery command имеет тройной guard: PostgreSQL, test marker и `elowyn_recovery_` prefix плюс
+  явное opt-in окружения.
+
+## Чего система всё ещё не гарантирует
+
+- Owner/admin credentials способны менять history; append-only гарантия относится к runtime role.
+- Нет RLS и multi-user isolation — v0.1 остаётся single-user.
+- Нет глобального causal sequence для Event разных concurrently изменяемых entities.
+- Graph edits сериализуются консервативно; это корректно для v0.1, но не является масштабируемой
+  worker architecture.
+- Локальный recovery drill не заменяет production backup retention, off-site storage, PITR и
+  регулярную operator-проверку.
+- Реальное качество/поведение внешнего LLM provider и Telegram network пока не доказано.
 
 ## Неблокирующая заметка для roadmap
 
-v0.1 сериализует Telegram turns и поддерживает монотонный Event timestamp внутри одного
-`WorldStateService`. Перед переходом к нескольким concurrent workers разумно добавить DB-backed
-порядковый ключ/sequence для глобального causal ordering Event. Текущая схема этому не препятствует.
+Перед переходом к нескольким concurrent workers разумно добавить DB-backed порядковый ключ/sequence
+для глобального causal ordering Event. Текущая схема этому не препятствует.

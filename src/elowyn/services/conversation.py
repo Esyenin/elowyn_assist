@@ -119,16 +119,20 @@ class ConversationService:
     async def has_assistant_reply(self, *, conversation_id, user_message_id) -> bool:
         token = str(user_message_id)
         messages = (
-            await self.session.execute(
-                select(Message)
-                .where(
-                    Message.conversation_id == conversation_id,
-                    Message.author == MessageAuthor.ASSISTANT,
+            (
+                await self.session.execute(
+                    select(Message)
+                    .where(
+                        Message.conversation_id == conversation_id,
+                        Message.author == MessageAuthor.ASSISTANT,
+                    )
+                    .order_by(Message.created_at.desc())
+                    .limit(100)
                 )
-                .order_by(Message.created_at.desc())
-                .limit(100)
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for message in messages:
             payload = message.raw_payload
             if not isinstance(payload, dict):
@@ -140,11 +144,15 @@ class ConversationService:
 
     async def recent_messages(self, conversation_id, *, limit: int = 12) -> list[Message]:
         messages = (
-            await self.session.execute(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.sent_at.desc(), Message.created_at.desc())
-                .limit(limit)
+            (
+                await self.session.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.sent_at.desc(), Message.created_at.desc())
+                    .limit(limit)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return list(reversed(messages))

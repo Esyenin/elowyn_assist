@@ -2,37 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import os
-from pathlib import Path
 import re
-import sys
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-
-pytestmark = pytest.mark.postgres
-
-if not os.environ.get("TEST_DATABASE_URL"):
-    pytest.skip("TEST_DATABASE_URL is not configured", allow_module_level=True)
-
-pytest.importorskip("asyncpg")
-pytest.importorskip("pydantic_ai")
-
 from pydantic import ValidationError
 from pydantic_ai import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from elowyn.db.base import Base
 from elowyn.db.models import (
     Decision,
     Entity,
-    EntityRelation,
     Event,
     Goal,
     Message,
@@ -52,7 +38,6 @@ from elowyn.domain.commands import (
     ProjectCreate,
     TaskAssessment,
     TaskCreate,
-    TaskDependencyCreate,
     TaskUpdate,
 )
 from elowyn.domain.enums import (
@@ -72,13 +57,18 @@ from elowyn.services.conversation import ConversationService
 from elowyn.services.world_state import ActionContext, WorldStateService
 from elowyn.transport.telegram import TelegramAdapter
 
+pytestmark = pytest.mark.postgres
+
+if not os.environ.get("TEST_DATABASE_URL"):
+    raise RuntimeError("TEST_DATABASE_URL is required for the full acceptance suite")
+
 
 @pytest.fixture
 async def session_factory():
     engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
     async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
-        await connection.run_sync(Base.metadata.create_all)
+        tables = ", ".join(f'"{table.name}"' for table in Base.metadata.sorted_tables)
+        await connection.execute(text(f"TRUNCATE TABLE {tables} CASCADE"))
     factory = async_sessionmaker(engine, expire_on_commit=False)
     yield factory
     await engine.dispose()
@@ -92,7 +82,9 @@ def scripted_model(tool_calls, final_text="Готово."):
         call_number += 1
         if call_number == 1:
             calls = tool_calls(messages) if callable(tool_calls) else tool_calls
-            return ModelResponse(parts=[ToolCallPart(tool_name=name, args=args) for name, args in calls])
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name=name, args=args) for name, args in calls]
+            )
         return ModelResponse(parts=[TextPart(final_text)])
 
     return FunctionModel(model_function)
@@ -140,7 +132,9 @@ async def user_source(session, *, external_message_id: str, text: str):
     return ingested.source
 
 
-async def test_acceptance_01_persistence_survives_restart_via_telegram_adapter(session_factory) -> None:
+async def test_acceptance_01_persistence_survives_restart_via_telegram_adapter(
+    session_factory,
+) -> None:
     adapter = TelegramAdapter(allowed_user_id=None)
     incoming = adapter.to_incoming(
         FakeTelegramMessage(
@@ -183,8 +177,12 @@ async def test_acceptance_01_persistence_survives_restart_via_telegram_adapter(s
     await restarted.handle_message(second)
 
     async with session_factory() as session:
-        project = (await session.execute(select(Project).where(Project.name == "Elowyn"))).scalar_one()
-        goal = (await session.execute(select(Goal).where(Goal.title == "Рабочая v0.1"))).scalar_one()
+        project = (
+            await session.execute(select(Project).where(Project.name == "Elowyn"))
+        ).scalar_one()
+        goal = (
+            await session.execute(select(Goal).where(Goal.title == "Рабочая v0.1"))
+        ).scalar_one()
         task = (
             await session.execute(select(Task).where(Task.title == "Подключить runtime"))
         ).scalar_one()
@@ -192,7 +190,9 @@ async def test_acceptance_01_persistence_survives_restart_via_telegram_adapter(s
         assert task.status == TaskStatus.IN_PROGRESS
 
 
-async def test_acceptance_02_natural_language_update_goes_through_domain_tool(session_factory) -> None:
+async def test_acceptance_02_natural_language_update_goes_through_domain_tool(
+    session_factory,
+) -> None:
     async with session_factory() as session:
         source = await user_source(session, external_message_id="10", text="Создай отчёт")
         task = await WorldStateService(session).create_task(
@@ -230,7 +230,9 @@ async def test_acceptance_02_natural_language_update_goes_through_domain_tool(se
         assert task.deadline_at.day == 28
 
 
-async def test_acceptance_03_history_and_provenance_point_to_original_message(session_factory) -> None:
+async def test_acceptance_03_history_and_provenance_point_to_original_message(
+    session_factory,
+) -> None:
     async with session_factory() as session:
         source = await user_source(session, external_message_id="20", text="Дедлайн 30-го")
         service = WorldStateService(session)
@@ -250,12 +252,19 @@ async def test_acceptance_03_history_and_provenance_point_to_original_message(se
         await session.commit()
 
         event = (
-            await session.execute(
-                select(Event)
-                .where(Event.entity_id == task.entity_id, Event.event_type == EventType.TASK_UPDATED)
-                .order_by(Event.created_at.desc())
+            (
+                await session.execute(
+                    select(Event)
+                    .where(
+                        Event.entity_id == task.entity_id,
+                        Event.event_type == EventType.TASK_UPDATED,
+                    )
+                    .order_by(Event.created_at.desc())
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         source_row = await session.get(Source, event.source_id)
         message = await session.get(Message, source_row.message_id)
         assert event.changes[0]["old"].startswith("2026-08-30")
@@ -264,7 +273,9 @@ async def test_acceptance_03_history_and_provenance_point_to_original_message(se
         assert message.text == "Теперь 28-го"
 
 
-async def test_acceptance_04_correction_creates_new_event_and_preserves_previous(session_factory) -> None:
+async def test_acceptance_04_correction_creates_new_event_and_preserves_previous(
+    session_factory,
+) -> None:
     async with session_factory() as session:
         source = await user_source(session, external_message_id="30", text="Дедлайн 30-го")
         service = WorldStateService(session)
@@ -277,7 +288,9 @@ async def test_acceptance_04_correction_creates_new_event_and_preserves_previous
             TaskUpdate(entity_id=task.entity_id, deadline_at=datetime(2026, 8, 29, tzinfo=UTC)),
             ActionContext(ActorType.USER, first),
         )
-        second = await user_source(session, external_message_id="32", text="Нет, я имел в виду 28-е")
+        second = await user_source(
+            session, external_message_id="32", text="Нет, я имел в виду 28-е"
+        )
         await service.update_task(
             TaskUpdate(entity_id=task.entity_id, deadline_at=datetime(2026, 8, 28, tzinfo=UTC)),
             ActionContext(ActorType.USER, second),
@@ -285,18 +298,27 @@ async def test_acceptance_04_correction_creates_new_event_and_preserves_previous
         await session.commit()
 
         events = (
-            await session.execute(
-                select(Event)
-                .where(Event.entity_id == task.entity_id, Event.event_type == EventType.TASK_UPDATED)
-                .order_by(Event.created_at)
+            (
+                await session.execute(
+                    select(Event)
+                    .where(
+                        Event.entity_id == task.entity_id,
+                        Event.event_type == EventType.TASK_UPDATED,
+                    )
+                    .order_by(Event.created_at)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(events) == 2
         assert events[0].changes[0]["new"].startswith("2026-08-29")
         assert events[1].changes[0]["new"].startswith("2026-08-28")
 
 
-async def test_acceptance_05_undo_writes_inverse_event_without_deleting_history(session_factory) -> None:
+async def test_acceptance_05_undo_writes_inverse_event_without_deleting_history(
+    session_factory,
+) -> None:
     async with session_factory() as session:
         source = await user_source(session, external_message_id="40", text="Дедлайн 30-го")
         service = WorldStateService(session)
@@ -310,12 +332,19 @@ async def test_acceptance_05_undo_writes_inverse_event_without_deleting_history(
             ActionContext(ActorType.USER, changed),
         )
         target = (
-            await session.execute(
-                select(Event)
-                .where(Event.entity_id == task.entity_id, Event.event_type == EventType.TASK_UPDATED)
-                .order_by(Event.created_at.desc())
+            (
+                await session.execute(
+                    select(Event)
+                    .where(
+                        Event.entity_id == task.entity_id,
+                        Event.event_type == EventType.TASK_UPDATED,
+                    )
+                    .order_by(Event.created_at.desc())
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         undo_source = await user_source(
             session, external_message_id="42", text="Верни как было до прошлого сообщения"
         )
@@ -344,14 +373,18 @@ async def test_acceptance_06_decision_lifecycle_supersedes_old_decision(session_
             ),
             ActionContext(ActorType.USER, source),
         )
-        revised_source = await user_source(session, external_message_id="51", text="Пересматриваем на B")
+        revised_source = await user_source(
+            session, external_message_id="51", text="Пересматриваем на B"
+        )
         new = await service.create_decision(
             DecisionCreate(
                 title="Выбор runtime",
                 chosen_option="B",
                 reasoning_summary="Надёжнее",
                 supersedes_decision_id=old.entity_id,
-                alternatives=[DecisionAlternativeCreate(option_text="A", rejection_summary="Ограничен")],
+                alternatives=[
+                    DecisionAlternativeCreate(option_text="A", rejection_summary="Ограничен")
+                ],
             ),
             ActionContext(ActorType.USER, revised_source),
         )
@@ -363,7 +396,9 @@ async def test_acceptance_06_decision_lifecycle_supersedes_old_decision(session_
         assert old_entity.superseded_by_entity_id == new.entity_id
         assert (
             await session.execute(
-                select(func.count()).select_from(Event).where(
+                select(func.count())
+                .select_from(Event)
+                .where(
                     Event.entity_id == old.entity_id,
                     Event.event_type == EventType.DECISION_SUPERSEDED,
                 )
@@ -402,10 +437,18 @@ async def test_acceptance_07_strict_and_semantic_relations(session_factory) -> N
         await session.commit()
 
         links = (
-            await session.execute(select(TaskGoalLink).where(TaskGoalLink.task_id == task.entity_id))
-        ).scalars().all()
+            (
+                await session.execute(
+                    select(TaskGoalLink).where(TaskGoalLink.task_id == task.entity_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert {link.goal_id for link in links} == {goal_a.entity_id, goal_b.entity_id}
-        assert await session.get(TaskDependency, (prerequisite.entity_id, task.entity_id)) is not None
+        assert (
+            await session.get(TaskDependency, (prerequisite.entity_id, task.entity_id)) is not None
+        )
         assert relation.relation_type == RelationType.RELATED_TO
         with pytest.raises(ValidationError):
             EntityRelationCreate(
@@ -415,7 +458,9 @@ async def test_acceptance_07_strict_and_semantic_relations(session_factory) -> N
             )
 
 
-async def test_acceptance_08_assistant_inference_has_confidence_and_user_correction_wins(session_factory) -> None:
+async def test_acceptance_08_assistant_inference_has_confidence_and_user_correction_wins(
+    session_factory,
+) -> None:
     async with session_factory() as session:
         source = await user_source(session, external_message_id="70", text="Новая задача")
         service = WorldStateService(session)
@@ -450,14 +495,18 @@ async def test_acceptance_08_assistant_inference_has_confidence_and_user_correct
         assert corrected.importance_source_id == correction.id
 
 
-async def test_acceptance_09_invalid_domain_command_changes_nothing_and_writes_no_event(session_factory) -> None:
+async def test_acceptance_09_invalid_domain_command_changes_nothing_and_writes_no_event(
+    session_factory,
+) -> None:
     async with session_factory() as session:
         source = await user_source(session, external_message_id="80", text="Невалидная ссылка")
         service = WorldStateService(session)
         before_entities = (
             await session.execute(select(func.count()).select_from(Entity))
         ).scalar_one()
-        before_events = (await session.execute(select(func.count()).select_from(Event))).scalar_one()
+        before_events = (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one()
         before_operations = (
             await session.execute(select(func.count()).select_from(Operation))
         ).scalar_one()
@@ -469,8 +518,12 @@ async def test_acceptance_09_invalid_domain_command_changes_nothing_and_writes_n
             )
         await session.commit()
 
-        assert (await session.execute(select(func.count()).select_from(Entity))).scalar_one() == before_entities
-        assert (await session.execute(select(func.count()).select_from(Event))).scalar_one() == before_events
+        assert (
+            await session.execute(select(func.count()).select_from(Entity))
+        ).scalar_one() == before_entities
+        assert (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one() == before_events
         assert (
             await session.execute(select(func.count()).select_from(Operation))
         ).scalar_one() == before_operations
