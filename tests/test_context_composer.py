@@ -126,7 +126,7 @@ async def test_relevant_previous_conversation_page_enters_context(session_factor
         await _page(session, "Communication Preferences", [_entry("User prefers concise replies.")])
 
         memory = FakeMemory((_recalled("unneeded fallback"),))
-        context = await ContextComposer(session, memory).memory_context(
+        context = await ContextComposer(session).memory_context(
             user_text="Please give a concise project reply.",
             world_state='{"projects": []}',
             history=[],
@@ -139,37 +139,19 @@ async def test_relevant_previous_conversation_page_enters_context(session_factor
 
 
 @pytest.mark.asyncio
-async def test_irrelevant_page_is_excluded_and_bounded_recall_is_filtered(session_factory) -> None:
+async def test_irrelevant_page_does_not_trigger_backend_recall(session_factory) -> None:
     async with session_factory() as session:
         await _page(session, "Tea Preferences", [_entry("User prefers green tea.")])
         memory = FakeMemory((_recalled("User once visited Lisbon."),))
 
-        context = await ContextComposer(session, memory).memory_context(
+        context = await ContextComposer(session).memory_context(
             user_text="Help debug the Python parser.",
             world_state="{}",
             history=[],
         )
 
         assert context is None
-        assert memory.recall_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_relevant_atomic_memory_is_a_bounded_fallback(session_factory) -> None:
-    async with session_factory() as session:
-        memory = FakeMemory((_recalled("User prefers jasmine tea in the morning."),))
-
-        context = await ContextComposer(session, memory).memory_context(
-            user_text="Which tea do I prefer in the morning?",
-            world_state="{}",
-            history=[],
-        )
-
-        assert context is not None
-        assert "jasmine tea" in context.text
-        assert "NON-AUTHORITATIVE" in context.text
-        assert memory.last_query.max_tokens == 256
-        assert context.token_upper_bound <= 512
+        assert memory.recall_calls == 0
 
 
 @pytest.mark.asyncio
@@ -184,7 +166,7 @@ async def test_memory_budget_and_item_limit_bound_repeated_history(session_facto
         ]
         await _page(session, "Python Preferences", entries)
         config = ContextComposerConfig(memory_token_budget=260, memory_item_limit=3)
-        composer = ContextComposer(session, FakeMemory(), config)
+        composer = ContextComposer(session, config)
 
         first = await composer.memory_context(
             user_text="Which Python preference matters?", world_state="{}", history=[]
@@ -204,7 +186,7 @@ async def test_current_explicit_update_suppresses_old_memory(session_factory) ->
     async with session_factory() as session:
         await _page(session, "Drink Preference", [_entry("User prefers tea in the morning.")])
 
-        context = await ContextComposer(session, FakeMemory()).memory_context(
+        context = await ContextComposer(session).memory_context(
             user_text="Actually, I now prefer coffee, not tea in the morning.",
             world_state="{}",
             history=[],
@@ -232,12 +214,12 @@ async def test_world_state_and_recent_context_are_not_duplicated(session_factory
             sent_at=datetime.now(UTC),
         )
 
-        from_world = await ContextComposer(session, FakeMemory()).memory_context(
+        from_world = await ContextComposer(session).memory_context(
             user_text="What storage does Aurora use?",
             world_state=f'{{"projects": [{{"description": "{statement}"}}]}}',
             history=[],
         )
-        from_recent = await ContextComposer(session, FakeMemory()).memory_context(
+        from_recent = await ContextComposer(session).memory_context(
             user_text="What storage does Aurora use?", world_state="{}", history=[recent]
         )
 
@@ -260,7 +242,7 @@ async def test_contested_observation_is_labeled_uncertain(session_factory) -> No
             ],
         )
 
-        context = await ContextComposer(session, FakeMemory()).memory_context(
+        context = await ContextComposer(session).memory_context(
             user_text="Which editor preference should we consider?",
             world_state="{}",
             history=[],
@@ -286,7 +268,7 @@ async def test_empty_memory_preserves_recent_message_prompt_behavior(session_fac
             )
             for index in range(20)
         ]
-        context = await ContextComposer(session, FakeMemory()).memory_context(
+        context = await ContextComposer(session).memory_context(
             user_text="unrelated current request", world_state="{}", history=history
         )
         prompt = build_turn_prompt(
@@ -314,11 +296,12 @@ async def test_hindsight_outage_does_not_break_real_turn_or_world_state(
     session_factory, monkeypatch
 ) -> None:
     agent = _FakeAgent()
+    memory = FakeMemory(unavailable=True)
     monkeypatch.setattr(runtime_module, "build_agent", lambda **kwargs: agent)
     runtime = ElowynRuntime(
         session_factory=session_factory,
         model=object(),
-        memory_service=FakeMemory(unavailable=True),
+        memory_service=memory,
     )
     incoming = IncomingMessage(
         transport=TransportType.INTERNAL,
@@ -331,6 +314,7 @@ async def test_hindsight_outage_does_not_break_real_turn_or_world_state(
     response = await runtime.handle_message(incoming)
 
     assert response == "normal response"
+    assert memory.recall_calls == 0
     assert "ТЕКУЩИЙ WORLD STATE (authoritative" in agent.prompt
     assert "MEMORY (DERIVED" not in agent.prompt
     async with session_factory() as session:

@@ -7,9 +7,11 @@ from elowyn.assistant.context import build_turn_prompt
 from elowyn.assistant.tools import build_agent
 from elowyn.domain.enums import ActorType
 from elowyn.domain.messages import IncomingMessage
+from elowyn.memory.deep import DeepMemoryRoute
 from elowyn.memory.service import MemoryService
 from elowyn.services.context_composer import ContextComposer, ContextComposerConfig
 from elowyn.services.conversation import ConversationService
+from elowyn.services.deep_memory import DeepMemoryService, route_deep_memory
 from elowyn.services.query import WorldStateQueryService
 from elowyn.services.world_state import ActionContext, WorldStateService
 
@@ -53,16 +55,20 @@ class ElowynRuntime:
                 query_service = WorldStateQueryService(session)
                 world_state = await query_service.render_for_llm()
                 memory_context = None
+                deep_memory_route = DeepMemoryRoute.NONE
+                deep_memory_service = None
                 if self.memory_service is not None:
                     memory_context = await ContextComposer(
                         session,
-                        self.memory_service,
                         self.context_composer_config,
                     ).memory_context(
                         user_text=incoming.text,
                         world_state=world_state,
                         history=history,
                     )
+                    deep_memory_route = route_deep_memory(incoming.text)
+                    if deep_memory_route != DeepMemoryRoute.NONE:
+                        deep_memory_service = DeepMemoryService(session, self.memory_service)
                 service = WorldStateService(session)
                 action_context = ActionContext(
                     actor_type=ActorType.USER,
@@ -75,6 +81,8 @@ class ElowynRuntime:
                     service=service,
                     query_service=query_service,
                     action_context=action_context,
+                    deep_memory_service=deep_memory_service,
+                    deep_memory_route=deep_memory_route,
                 )
                 prompt = build_turn_prompt(
                     user_text=incoming.text,
