@@ -13,6 +13,7 @@ from elowyn.db.models import (
     Conversation,
     MemoryIngestionReceipt,
     MemoryIngestionState,
+    MemoryPage,
     Message,
 )
 from elowyn.domain.enums import MemoryIngestionStatus, MessageAuthor, TransportType
@@ -296,6 +297,37 @@ async def test_post_commit_wakeup_runs_ingestion_outside_the_turn(session_factor
     assert [call[0].source.message_id for call in memory.calls] == [messages[0].id]
     _, receipt_count = await _state_snapshot(session_factory)
     assert receipt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_ingestion_refreshes_repeated_preference_page(session_factory) -> None:
+    async with session_factory() as session:
+        conversation = Conversation(transport=TransportType.INTERNAL)
+        session.add(conversation)
+        await session.flush()
+        for minute in (0, 1):
+            session.add(
+                Message(
+                    conversation_id=conversation.id,
+                    author=MessageAuthor.USER,
+                    text="I prefer concise synthetic technical answers.",
+                    sent_at=datetime(2026, 8, 22, 10, minute, tzinfo=UTC),
+                )
+            )
+        await session.commit()
+    processor = MemoryIngestionProcessor(
+        session_factory,
+        RecordingMemory(),
+        MemoryPipelineConfig(backend="synthetic-v1"),
+    )
+
+    assert await processor.process_once() is True
+
+    async with session_factory() as session:
+        page = (await session.execute(select(MemoryPage))).scalar_one()
+        assert [entry["statement"] for entry in page.entries] == [
+            "I prefer concise synthetic technical answers."
+        ]
 
 
 @pytest.mark.asyncio

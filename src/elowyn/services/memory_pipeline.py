@@ -1,17 +1,58 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from elowyn.memory.service import MemoryService, MemorySource, RetainMessage
+from sqlalchemy import func, select
+
+from elowyn.db.models import Message
+from elowyn.domain.enums import MemoryPageType, MessageAuthor, SemanticCategory
+from elowyn.memory.observations import ObservationCandidate, ObservationEvidence
+from elowyn.memory.semantics import classify_semantics
+from elowyn.memory.service import (
+    MemoryProvenance,
+    MemoryService,
+    MemorySource,
+    RetainMessage,
+)
+from elowyn.services.conversation_summary import ConversationSummaryService
+from elowyn.services.memory_consolidation import (
+    MemoryPageService,
+    ObservationConsolidationService,
+)
 from elowyn.services.memory_ingestion import CatchUpBatch, MemoryIngestionStateService
 
 logger = logging.getLogger(__name__)
 
 _INGESTION_OPERATION_NAMESPACE = uuid.UUID("0638258d-a320-42d9-940e-805f37bb2dc9")
+_SUMMARY_VERSION = "elowyn-archive-summary-v1"
+_COMMUNICATION_TERMS = {
+    "answer",
+    "brief",
+    "concise",
+    "communication",
+    "reply",
+    "response",
+    "кратк",
+    "общен",
+    "ответ",
+}
+_TOPIC_STOP_WORDS = {
+    "about",
+    "and",
+    "для",
+    "или",
+    "мне",
+    "the",
+    "this",
+    "user",
+    "что",
+    "это",
+}
 
 
 @dataclass(frozen=True)
@@ -81,6 +122,13 @@ class MemoryIngestionProcessor:
                 await self._record_receipt(batch.state_id, message.id)
 
             await self._finish(batch)
+            try:
+                await self._refresh_derived(batch)
+            except Exception:
+                # Atomic retention/cursor success remains valid. Derived summaries,
+                # observations, and pages are disposable and full rebuild remains
+                # the recovery path if an opportunistic refresh fails.
+                logger.warning("Memory derived refresh failed; raw archive remains rebuildable")
             return True
         except asyncio.CancelledError:
             # Leave the committed PROCESSING lease in place. Restart recovery
@@ -142,6 +190,112 @@ class MemoryIngestionProcessor:
             )
             await session.commit()
 
+    async def _refresh_derived(self, batch: CatchUpBatch) -> None:
+        conversation_ids = {message.conversation_id for message in batch.messages}
+        user_texts = {
+            " ".join((message.text or "").split())
+            for message in batch.messages
+            if message.author == MessageAuthor.USER and (message.text or "").strip()
+        }
+        async with self.session_factory() as session:
+            for conversation_id in conversation_ids:
+                messages = list(
+                    (
+                        await session.execute(
+                            select(Message)
+                            .where(
+                                Message.conversation_id == conversation_id,
+                                Message.text.is_not(None),
+                                func.length(func.trim(Message.text)) > 0,
+                            )
+                            .order_by(Message.sent_at, Message.created_at, Message.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not messages:
+                    continue
+                await ConversationSummaryService(session).save(
+                    conversation_id=conversation_id,
+                    short_summary=_clip(
+                        " | ".join(
+                            f"{message.author.value}: {message.text}" for message in messages
+                        ),
+                        600,
+                    ),
+                    topics=list(
+                        dict.fromkeys(
+                            classify_semantics(message.text or "").category.value.casefold()
+                            for message in messages
+                        )
+                    ),
+                    related_entity_ids=[],
+                    last_processed_message_id=messages[-1].id,
+                    derivation_version=_SUMMARY_VERSION,
+                )
+
+            pages: set[tuple[MemoryPageType, str, str]] = set()
+            consolidation = ObservationConsolidationService(session)
+            for text in sorted(user_texts):
+                evidence_messages = list(
+                    (
+                        await session.execute(
+                            select(Message)
+                            .where(
+                                Message.author == MessageAuthor.USER,
+                                Message.text == text,
+                            )
+                            .order_by(Message.sent_at, Message.created_at, Message.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not evidence_messages:
+                    continue
+                semantics = classify_semantics(text)
+                page_type, scope_key, title = _page_for(semantics.category, text)
+                claim_hash = hashlib.sha256(text.casefold().encode("utf-8")).hexdigest()[:24]
+                await consolidation.consolidate(
+                    ObservationCandidate(
+                        claim_key=f"archive:{claim_hash}",
+                        statement=_clip(text, 400),
+                        category=semantics.category,
+                        evidence=tuple(
+                            ObservationEvidence(
+                                backend_memory_id=(
+                                    "operation:"
+                                    + str(
+                                        ingestion_operation_id(
+                                            backend=batch.backend,
+                                            message_id=message.id,
+                                        )
+                                    )
+                                ),
+                                provenance=MemoryProvenance(
+                                    conversation_id=message.conversation_id,
+                                    message_id=message.id,
+                                    role=message.author.value,
+                                    occurred_at=_aware(message.sent_at),
+                                ),
+                            )
+                            for message in evidence_messages
+                        ),
+                        page_type=page_type,
+                        page_scope_key=scope_key,
+                        page_title=title,
+                    )
+                )
+                pages.add((page_type, scope_key, title))
+            for page_type, scope_key, title in pages:
+                await MemoryPageService(session).refresh(
+                    page_type=page_type,
+                    scope_key=scope_key,
+                    title=title,
+                )
+            await session.commit()
+
 
 class MemoryIngestionWorker:
     """Lifecycle-owned wakeable catch-up loop; raw messages remain the durable queue."""
@@ -195,3 +349,35 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _page_for(category: SemanticCategory, text: str) -> tuple[MemoryPageType, str, str]:
+    lowered = text.casefold()
+    if category == SemanticCategory.PREFERENCE:
+        if any(term in lowered for term in _COMMUNICATION_TERMS):
+            return (
+                MemoryPageType.COMMUNICATION_PREFERENCES,
+                "user",
+                "Communication Preferences",
+            )
+        return MemoryPageType.USER_PROFILE, "user", "User Profile"
+    topic = next(
+        (
+            token
+            for token in _words(lowered)
+            if len(token) >= 3 and token not in _TOPIC_STOP_WORDS
+        ),
+        category.value.casefold(),
+    )
+    return MemoryPageType.TOPIC, topic, f"Topic: {topic}"
+
+
+def _words(value: str) -> list[str]:
+    return [
+        "".join(character for character in token if character.isalnum())
+        for token in value.split()
+    ]
+
+
+def _clip(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"

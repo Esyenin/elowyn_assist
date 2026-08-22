@@ -19,7 +19,10 @@ import uuid
 
 HINDSIGHT_IMAGE = "ghcr.io/vectorize-io/hindsight:0.9.1"
 READINESS_TIMEOUT_SECONDS = 300
-INTEGRATION_TEST = "tests/integration/test_hindsight_adapter.py"
+INTEGRATION_TESTS = (
+    "tests/integration/test_hindsight_adapter.py",
+    "tests/integration/test_memory_v02_acceptance.py",
+)
 
 
 def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -115,13 +118,14 @@ def main() -> int:
 
         test_environment = os.environ.copy()
         test_environment["ELOWYN_TEST_HINDSIGHT_URL"] = base_url
+        test_environment["ELOWYN_TEST_HINDSIGHT_CONTAINER"] = container_name
         test_environment["ELOWYN_FAIL_ON_SKIP"] = "1"
         completed = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pytest",
-                INTEGRATION_TEST,
+                *INTEGRATION_TESTS,
                 "-m",
                 "hindsight",
                 "-q",
