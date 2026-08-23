@@ -5,6 +5,7 @@ All DB-backed tools are sequential because they share one SQLAlchemy AsyncSessio
 
 from __future__ import annotations
 
+from elowyn.assistant.deep_memory_tools import deep_memory_policy, register_deep_memory_tools
 from elowyn.domain.commands import (
     DecisionCreate,
     DecisionRevoke,
@@ -26,6 +27,8 @@ from elowyn.domain.commands import (
     TaskGoalLinkCreate,
     TaskUpdate,
 )
+from elowyn.memory.deep import DeepMemoryRoute
+from elowyn.services.deep_memory import DeepMemoryService
 from elowyn.services.query import WorldStateQueryService
 from elowyn.services.world_state import (
     ActionContext,
@@ -39,17 +42,28 @@ def build_agent(
     service: WorldStateService,
     query_service: WorldStateQueryService,
     action_context: ActionContext,
+    deep_memory_service: DeepMemoryService | None = None,
+    deep_memory_route: DeepMemoryRoute = DeepMemoryRoute.NONE,
 ):
     from pydantic_ai import Agent
 
     from elowyn.assistant.identity import load_identity_prompt
 
-    agent = Agent(model=model, system_prompt=load_identity_prompt())
+    system_prompt = load_identity_prompt()
+    if deep_memory_service is not None and deep_memory_route != DeepMemoryRoute.NONE:
+        system_prompt += deep_memory_policy(deep_memory_route)
+    agent = Agent(model=model, system_prompt=system_prompt)
 
     @agent.tool_plain(sequential=True)
     async def query_world_state(search_text: str | None = None) -> str:
         """Read current state; returned IDs are internal and must not be shown to the user."""
         return await query_service.render_for_llm(search_text=search_text)
+
+    if deep_memory_service is not None and deep_memory_route != DeepMemoryRoute.NONE:
+        # A deep-memory answer cannot directly invoke a canonical write. If the user
+        # also requests a state change, it can be handled as a separate normal turn.
+        register_deep_memory_tools(agent, deep_memory_service, deep_memory_route)
+        return agent
 
     @agent.tool_plain(sequential=True)
     async def create_task(command: TaskCreate) -> dict[str, str]:

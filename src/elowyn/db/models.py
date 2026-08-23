@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -26,10 +27,16 @@ from elowyn.domain.enums import (
     DecisionStatus,
     EntityType,
     EventType,
+    EvidenceStance,
     GoalStatus,
+    MemoryGenerationStatus,
+    MemoryIngestionStatus,
+    MemoryPageType,
     MessageAuthor,
+    ObservationStatus,
     ProjectStatus,
     RelationType,
+    SemanticCategory,
     SourceType,
     SuccessCriterionStatus,
     TaskStatus,
@@ -119,6 +126,263 @@ class Message(Base):
     )
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class ConversationSummary(Base):
+    """Disposable, Core-owned navigation shortcut derived from raw messages."""
+
+    __tablename__ = "conversation_summaries"
+    __table_args__ = (
+        CheckConstraint("length(trim(short_summary)) > 0", name="ck_summary_not_blank"),
+        CheckConstraint(
+            "length(trim(derivation_version)) > 0", name="ck_summary_version_not_blank"
+        ),
+    )
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    short_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    topics: Mapped[list[str]] = mapped_column(JSON_DATA, default=list, nullable=False)
+    related_entity_ids: Mapped[list[str]] = mapped_column(JSON_DATA, default=list, nullable=False)
+    last_processed_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    derivation_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryIngestionState(Base):
+    """Durable backend lease/cursor; receipts make the cursor lossless."""
+
+    __tablename__ = "memory_ingestion_states"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "backend", name="uq_memory_ingestion_backend"),
+        CheckConstraint("length(trim(backend)) > 0", name="ck_memory_backend_not_blank"),
+        CheckConstraint("attempts >= 0", name="ck_memory_ingestion_attempts"),
+        CheckConstraint(
+            "(status = 'PROCESSING' AND lease_expires_at IS NOT NULL) OR "
+            "(status <> 'PROCESSING' AND lease_expires_at IS NULL)",
+            name="ck_memory_ingestion_lease_consistent",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    backend: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_succeeded_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[MemoryIngestionStatus] = mapped_column(
+        enum_type(MemoryIngestionStatus, name="memory_ingestion_status"),
+        default=MemoryIngestionStatus.IDLE,
+        nullable=False,
+        index=True,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryIngestionReceipt(Base):
+    """Per-message success ledger used to discover every gap in the raw archive."""
+
+    __tablename__ = "memory_ingestion_receipts"
+
+    state_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_ingestion_states.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    succeeded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryGeneration(Base):
+    """Journal for disposable backend generations built from the raw archive."""
+
+    __tablename__ = "memory_generations"
+    __table_args__ = (
+        UniqueConstraint("bank_id", name="uq_memory_generation_bank"),
+        CheckConstraint("length(trim(backend)) > 0", name="ck_memory_generation_backend"),
+        CheckConstraint("length(trim(bank_id)) > 0", name="ck_memory_generation_bank"),
+        CheckConstraint("messages_total >= 0", name="ck_memory_generation_total"),
+        CheckConstraint("messages_replayed >= 0", name="ck_memory_generation_replayed"),
+        CheckConstraint("messages_verified >= 0", name="ck_memory_generation_verified"),
+        CheckConstraint(
+            "messages_replayed <= messages_total",
+            name="ck_memory_generation_progress",
+        ),
+        CheckConstraint(
+            "(status = 'BUILDING' AND lease_expires_at IS NOT NULL) OR "
+            "(status <> 'BUILDING' AND lease_expires_at IS NULL)",
+            name="ck_memory_generation_lease",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    backend: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    bank_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[MemoryGenerationStatus] = mapped_column(
+        enum_type(MemoryGenerationStatus, name="memory_generation_status"),
+        nullable=False,
+        index=True,
+    )
+    messages_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    messages_replayed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    messages_verified: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryBackendRegistry(Base):
+    """Single atomic pointer to the active backend generation."""
+
+    __tablename__ = "memory_backend_registries"
+    __table_args__ = (
+        CheckConstraint("length(trim(backend)) > 0", name="ck_memory_registry_backend"),
+    )
+
+    backend: Mapped[str] = mapped_column(String(100), primary_key=True)
+    active_generation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memory_generations.id", ondelete="RESTRICT"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryObservation(Base):
+    """Elowyn-owned, evidence-backed derived belief; never canonical state."""
+
+    __tablename__ = "memory_observations"
+    __table_args__ = (
+        CheckConstraint("length(trim(claim_key)) > 0", name="ck_observation_claim_key"),
+        CheckConstraint("length(trim(statement)) > 0", name="ck_observation_statement"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_observation_confidence"),
+        CheckConstraint(
+            "superseded_by_id IS NULL OR superseded_by_id <> id",
+            name="ck_observation_not_superseded_by_self",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    claim_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[SemanticCategory] = mapped_column(
+        enum_type(SemanticCategory, name="memory_semantic_category"), nullable=False
+    )
+    status: Mapped[ObservationStatus] = mapped_column(
+        enum_type(ObservationStatus, name="memory_observation_status"),
+        nullable=False,
+        index=True,
+    )
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    page_type: Mapped[MemoryPageType] = mapped_column(
+        enum_type(MemoryPageType, name="memory_page_type"), nullable=False, index=True
+    )
+    page_scope_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memory_observations.id", ondelete="SET NULL"), nullable=True
+    )
+    derivation_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MemoryObservationEvidence(Base):
+    """Distinct atomic-memory evidence linked back to one canonical Message."""
+
+    __tablename__ = "memory_observation_evidence"
+    __table_args__ = (
+        CheckConstraint("length(trim(backend_memory_id)) > 0", name="ck_evidence_backend_id"),
+        CheckConstraint("length(trim(assertion_text)) > 0", name="ck_evidence_assertion"),
+    )
+
+    observation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_observations.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    backend_memory_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    stance: Mapped[EvidenceStance] = mapped_column(
+        enum_type(EvidenceStance, name="memory_evidence_stance"), nullable=False
+    )
+    assertion_text: Mapped[str] = mapped_column(Text, nullable=False)
+    explicit_correction: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryPage(Base):
+    """Compact, independently refreshable navigation shortcut over observations."""
+
+    __tablename__ = "memory_pages"
+    __table_args__ = (
+        UniqueConstraint("page_type", "scope_key", name="uq_memory_page_scope"),
+        CheckConstraint("length(trim(scope_key)) > 0", name="ck_memory_page_scope"),
+        CheckConstraint("length(trim(title)) > 0", name="ck_memory_page_title"),
+        CheckConstraint("max_entries > 0 AND max_entries <= 12", name="ck_memory_page_limit"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    page_type: Mapped[MemoryPageType] = mapped_column(
+        enum_type(MemoryPageType, name="memory_page_type"), nullable=False, index=True
+    )
+    scope_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    entries: Mapped[list[dict[str, Any]]] = mapped_column(JSON_DATA, default=list, nullable=False)
+    max_entries: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
+    derivation_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryPageObservation(Base):
+    __tablename__ = "memory_page_observations"
+
+    page_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_pages.id", ondelete="CASCADE"), primary_key=True
+    )
+    observation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memory_observations.id", ondelete="CASCADE"), primary_key=True
+    )
 
 
 class Source(Base):
