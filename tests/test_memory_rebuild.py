@@ -131,6 +131,8 @@ class GenerationFactory:
         self.created: list[str] = []
         self.next_fail_at: int | None = None
         self.next_cancel_at: int | None = None
+        self.deleted: list[str] = []
+        self.delete_error: Exception | None = None
 
     def open(self, bank_id: str) -> GenerationMemory:
         return self.banks.setdefault(bank_id, GenerationMemory(bank_id))
@@ -145,6 +147,12 @@ class GenerationFactory:
         self.banks[bank_id] = memory
         self.created.append(bank_id)
         return memory
+
+    async def delete_bank(self, bank_id: str) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.banks.pop(bank_id, None)
+        self.deleted.append(bank_id)
 
 
 def _manager(session_factory, factory: GenerationFactory, **kwargs) -> MemoryGenerationManager:
@@ -421,6 +429,113 @@ async def test_interrupted_rebuild_is_detected_then_restart_builds_a_new_bank(
             or 0
         )
         assert failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_is_explicit_and_never_selects_active_or_building(
+    session_factory,
+) -> None:
+    factory = GenerationFactory()
+    factory.open("stable-bank")
+    manager = _manager(session_factory, factory)
+    active_id = await manager.bootstrap_existing("stable-bank")
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        failed = MemoryGeneration(
+            backend=BACKEND,
+            bank_id="failed-bank",
+            status=MemoryGenerationStatus.FAILED,
+            completed_at=now,
+        )
+        superseded = MemoryGeneration(
+            backend=BACKEND,
+            bank_id="superseded-bank",
+            status=MemoryGenerationStatus.SUPERSEDED,
+            completed_at=now,
+        )
+        building = MemoryGeneration(
+            backend=BACKEND,
+            bank_id="building-bank",
+            status=MemoryGenerationStatus.BUILDING,
+            lease_expires_at=now + timedelta(minutes=5),
+        )
+        session.add_all((failed, superseded, building))
+        await session.commit()
+        candidate_ids = {failed.id, superseded.id}
+        building_id = building.id
+    for bank_id in ("failed-bank", "superseded-bank", "building-bank"):
+        factory.open(bank_id)
+
+    candidates = await manager.cleanup_candidates()
+    assert {item.generation_id for item in candidates} == candidate_ids
+    with pytest.raises(PermissionError, match="explicit opt-in"):
+        await manager.cleanup_orphans(tuple(candidate_ids))
+    cleaned = await manager.cleanup_orphans(tuple(candidate_ids), explicit=True)
+
+    assert set(cleaned) == candidate_ids
+    assert set(factory.deleted) == {"failed-bank", "superseded-bank"}
+    async with session_factory() as session:
+        assert await session.get(MemoryGeneration, active_id) is not None
+        assert await session.get(MemoryGeneration, building_id) is not None
+        for generation_id in candidate_ids:
+            assert await session.get(MemoryGeneration, generation_id) is None
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_rejects_active_and_valid_building_generations(
+    session_factory,
+) -> None:
+    factory = GenerationFactory()
+    factory.open("stable-bank")
+    manager = _manager(session_factory, factory)
+    active_id = await manager.bootstrap_existing("stable-bank")
+    async with session_factory() as session:
+        building = MemoryGeneration(
+            backend=BACKEND,
+            bank_id="building-bank",
+            status=MemoryGenerationStatus.BUILDING,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        session.add(building)
+        await session.commit()
+        building_id = building.id
+
+    with pytest.raises(MemoryRebuildError, match="active memory generation"):
+        await manager.cleanup_orphans((active_id,), explicit=True)
+    with pytest.raises(MemoryRebuildError, match="BUILDING memory generation"):
+        await manager.cleanup_orphans((building_id,), explicit=True)
+    assert factory.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_backend_failure_preserves_generation_journal(
+    session_factory,
+) -> None:
+    factory = GenerationFactory()
+    factory.open("stable-bank")
+    manager = _manager(session_factory, factory)
+    await manager.bootstrap_existing("stable-bank")
+    async with session_factory() as session:
+        failed = MemoryGeneration(
+            backend=BACKEND,
+            bank_id="failed-bank",
+            status=MemoryGenerationStatus.FAILED,
+            completed_at=datetime.now(UTC),
+        )
+        session.add(failed)
+        await session.commit()
+        failed_id = failed.id
+    factory.open("failed-bank")
+    factory.delete_error = RuntimeError("synthetic backend deletion failure")
+
+    with pytest.raises(RuntimeError, match="backend deletion failure"):
+        await manager.cleanup_orphans((failed_id,), explicit=True)
+
+    async with session_factory() as session:
+        preserved = await session.get(MemoryGeneration, failed_id)
+        assert preserved is not None
+        assert preserved.status == MemoryGenerationStatus.FAILED
+    assert "failed-bank" in factory.banks
 
 
 @pytest.mark.asyncio

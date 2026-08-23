@@ -239,6 +239,13 @@ async def test_real_hindsight_091_full_pipeline_rebuild_and_outage_recovery() ->
                 for message in (messages[1], messages[-1])
             },
         )
+        cleanup_candidates = await manager.cleanup_candidates()
+        assert [item.bank_id for item in cleanup_candidates] == [initial_bank]
+        cleaned = await manager.cleanup_orphans(
+            tuple(item.generation_id for item in cleanup_candidates),
+            explicit=True,
+        )
+        assert cleaned == tuple(item.generation_id for item in cleanup_candidates)
         async with session_factory() as session:
             for item in after_rebuild.memories:
                 if item.provenance is not None:

@@ -26,6 +26,8 @@ class MemoryBackendFactory(Protocol):
 
     async def create_clean(self, bank_id: str) -> MemoryService: ...
 
+    async def delete_bank(self, bank_id: str) -> None: ...
+
 
 _Result = TypeVar("_Result")
 

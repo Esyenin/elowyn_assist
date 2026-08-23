@@ -77,6 +77,11 @@ class MemoryIngestionStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class MemoryIngestionOutcome(StrEnum):
+    INGESTED = "INGESTED"
+    IGNORED_BLANK = "IGNORED_BLANK"
+
+
 class MemoryGenerationStatus(StrEnum):
     BUILDING = "BUILDING"
     ACTIVE = "ACTIVE"

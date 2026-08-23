@@ -24,7 +24,11 @@ from elowyn.services.memory_consolidation import (
     MemoryPageService,
     ObservationConsolidationService,
 )
-from elowyn.services.memory_ingestion import CatchUpBatch, MemoryIngestionStateService
+from elowyn.services.memory_ingestion import (
+    CatchUpBatch,
+    DerivedRefreshClaim,
+    MemoryIngestionStateService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,20 +93,25 @@ class MemoryIngestionProcessor:
         current_time = now or datetime.now(UTC)
         batch = await self._claim(current_time)
         if batch is None:
-            return False
+            return await self._reconcile_one(current_time)
 
         try:
-            health = await self.memory.health()
-            if not health.ready:
-                await self._mark_failed(
-                    batch,
-                    current_time=current_time,
-                    error=f"{health.backend} is not ready",
-                )
-                return True
-
+            backend_ready = False
             for message in batch.messages:
                 await self._renew_lease(batch.state_id)
+                if not (message.text or "").strip():
+                    await self._record_ignored(batch.state_id, message.id)
+                    continue
+                if not backend_ready:
+                    health = await self.memory.health()
+                    if not health.ready:
+                        await self._mark_failed(
+                            batch,
+                            current_time=current_time,
+                            error=f"{health.backend} is not ready",
+                        )
+                        return True
+                    backend_ready = True
                 retain_message = RetainMessage(
                     source=MemorySource(
                         conversation_id=message.conversation_id,
@@ -122,13 +131,7 @@ class MemoryIngestionProcessor:
                 await self._record_receipt(batch.state_id, message.id)
 
             await self._finish(batch)
-            try:
-                await self._refresh_derived(batch)
-            except Exception:
-                # Atomic retention/cursor success remains valid. Derived summaries,
-                # observations, and pages are disposable and full rebuild remains
-                # the recovery path if an opportunistic refresh fails.
-                logger.warning("Memory derived refresh failed; raw archive remains rebuildable")
+            await self._reconcile_one(current_time)
             return True
         except asyncio.CancelledError:
             # Leave the committed PROCESSING lease in place. Restart recovery
@@ -165,6 +168,12 @@ class MemoryIngestionProcessor:
             await state.record_message_succeeded(state_id=state_id, message_id=message_id)
             await session.commit()
 
+    async def _record_ignored(self, state_id: uuid.UUID, message_id: uuid.UUID) -> None:
+        async with self.session_factory() as session:
+            state = MemoryIngestionStateService(session, backend=self.config.backend)
+            await state.record_message_ignored(state_id=state_id, message_id=message_id)
+            await session.commit()
+
     async def _finish(self, batch: CatchUpBatch) -> None:
         async with self.session_factory() as session:
             state = MemoryIngestionStateService(session, backend=self.config.backend)
@@ -190,34 +199,57 @@ class MemoryIngestionProcessor:
             )
             await session.commit()
 
-    async def _refresh_derived(self, batch: CatchUpBatch) -> None:
-        conversation_ids = {message.conversation_id for message in batch.messages}
-        user_texts = {
-            " ".join((message.text or "").split())
-            for message in batch.messages
-            if message.author == MessageAuthor.USER and (message.text or "").strip()
-        }
+    async def _reconcile_one(self, current_time: datetime) -> bool:
         async with self.session_factory() as session:
-            for conversation_id in conversation_ids:
-                messages = list(
-                    (
-                        await session.execute(
-                            select(Message)
-                            .where(
-                                Message.conversation_id == conversation_id,
-                                Message.text.is_not(None),
-                                func.length(func.trim(Message.text)) > 0,
-                            )
-                            .order_by(Message.sent_at, Message.created_at, Message.id)
-                        )
-                    )
-                    .scalars()
-                    .all()
+            state = MemoryIngestionStateService(session, backend=self.config.backend)
+            claim = await state.claim_derived_refresh(now=current_time)
+            await session.commit()
+        if claim is None:
+            return False
+        try:
+            await self._refresh_derived(claim)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            async with self.session_factory() as session:
+                state = MemoryIngestionStateService(session, backend=self.config.backend)
+                await state.mark_derived_failed(
+                    state_id=claim.state_id,
+                    error=f"{type(exc).__name__}: memory derived refresh failed",
+                    retry_at=current_time + retry_delay(self.config, claim.attempt),
                 )
-                if not messages:
-                    continue
+                await session.commit()
+            logger.warning("Memory derived refresh failed; durable reconciliation is pending")
+            return True
+        async with self.session_factory() as session:
+            state = MemoryIngestionStateService(session, backend=self.config.backend)
+            await state.mark_derived_succeeded(
+                state_id=claim.state_id,
+                through_message_id=claim.through_message_id,
+            )
+            await session.commit()
+        return True
+
+    async def _refresh_derived(self, claim: DerivedRefreshClaim) -> None:
+        async with self.session_factory() as session:
+            messages = list(
+                (
+                    await session.execute(
+                        select(Message)
+                        .where(
+                            Message.conversation_id == claim.conversation_id,
+                            Message.text.is_not(None),
+                            func.length(func.trim(Message.text)) > 0,
+                        )
+                        .order_by(Message.sent_at, Message.created_at, Message.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if messages:
                 await ConversationSummaryService(session).save(
-                    conversation_id=conversation_id,
+                    conversation_id=claim.conversation_id,
                     short_summary=_clip(
                         " | ".join(
                             f"{message.author.value}: {message.text}" for message in messages
@@ -235,6 +267,11 @@ class MemoryIngestionProcessor:
                     derivation_version=_SUMMARY_VERSION,
                 )
 
+            user_texts = {
+                " ".join((message.text or "").split())
+                for message in messages
+                if message.author == MessageAuthor.USER and (message.text or "").strip()
+            }
             pages: set[tuple[MemoryPageType, str, str]] = set()
             consolidation = ObservationConsolidationService(session)
             for text in sorted(user_texts):
@@ -268,7 +305,7 @@ class MemoryIngestionProcessor:
                                     "operation:"
                                     + str(
                                         ingestion_operation_id(
-                                            backend=batch.backend,
+                                            backend=self.config.backend,
                                             message_id=message.id,
                                         )
                                     )

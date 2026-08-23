@@ -259,6 +259,19 @@ class HindsightBackendFactory:
             raise MemoryBackendError("Hindsight clean bank creation failed") from exc
         return adapter
 
+    async def delete_bank(self, bank_id: str) -> None:
+        adapter = self.open(bank_id)
+        try:
+            await adapter._client.banks.delete_bank(
+                bank_id,
+                _request_timeout=self.timeout_seconds,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) != 404:
+                raise MemoryBackendError("Hindsight bank deletion failed") from exc
+        finally:
+            await adapter.close()
+
 
 def document_id_for(conversation_id: uuid.UUID) -> str:
     return f"elowyn:conversation:{conversation_id}"

@@ -13,7 +13,7 @@ from elowyn.db.models import (
     MemoryIngestionState,
     Message,
 )
-from elowyn.domain.enums import MemoryIngestionStatus
+from elowyn.domain.enums import MemoryIngestionOutcome, MemoryIngestionStatus
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,14 @@ class CatchUpBatch:
     @property
     def through_message_id(self) -> uuid.UUID:
         return self.messages[-1].id
+
+
+@dataclass(frozen=True)
+class DerivedRefreshClaim:
+    state_id: uuid.UUID
+    conversation_id: uuid.UUID
+    through_message_id: uuid.UUID
+    attempt: int
 
 
 class MemoryIngestionStateService:
@@ -159,8 +167,73 @@ class MemoryIngestionStateService:
     ) -> None:
         """Persist one backend-confirmed receipt while retaining the batch lease."""
         state = await self._locked_state(state_id)
-        messages = await self._record_receipts(state, (message_id,))
+        messages = await self._record_receipts(
+            state, (message_id,), outcome=MemoryIngestionOutcome.INGESTED
+        )
         state.last_succeeded_message_id = messages[-1].id
+        state.derived_dirty_through_message_id = messages[-1].id
+        state.derived_next_attempt_at = None
+        await self.session.flush()
+
+    async def record_message_ignored(
+        self, *, state_id: uuid.UUID, message_id: uuid.UUID
+    ) -> None:
+        """Advance the durable ledger for content that cannot produce semantic memory."""
+        state = await self._locked_state(state_id)
+        messages = await self._record_receipts(
+            state, (message_id,), outcome=MemoryIngestionOutcome.IGNORED_BLANK
+        )
+        state.last_succeeded_message_id = messages[-1].id
+        await self.session.flush()
+
+    async def claim_derived_refresh(
+        self, *, now: datetime | None = None
+    ) -> DerivedRefreshClaim | None:
+        current_time = now or datetime.now(UTC)
+        state = (
+            await self.session.execute(
+                select(MemoryIngestionState)
+                .where(
+                    MemoryIngestionState.backend == self.backend,
+                    MemoryIngestionState.derived_dirty_through_message_id.is_not(None),
+                    (
+                        MemoryIngestionState.derived_next_attempt_at.is_(None)
+                        | (MemoryIngestionState.derived_next_attempt_at <= current_time)
+                    ),
+                )
+                .order_by(MemoryIngestionState.updated_at, MemoryIngestionState.id)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if state is None or state.derived_dirty_through_message_id is None:
+            return None
+        state.derived_attempts += 1
+        await self.session.flush()
+        return DerivedRefreshClaim(
+            state_id=state.id,
+            conversation_id=state.conversation_id,
+            through_message_id=state.derived_dirty_through_message_id,
+            attempt=state.derived_attempts,
+        )
+
+    async def mark_derived_succeeded(
+        self, *, state_id: uuid.UUID, through_message_id: uuid.UUID
+    ) -> None:
+        state = await self._locked_state(state_id)
+        if state.derived_dirty_through_message_id == through_message_id:
+            state.derived_dirty_through_message_id = None
+        state.derived_attempts = 0
+        state.derived_next_attempt_at = None
+        state.derived_last_error = None
+        await self.session.flush()
+
+    async def mark_derived_failed(
+        self, *, state_id: uuid.UUID, error: str, retry_at: datetime
+    ) -> None:
+        state = await self._locked_state(state_id)
+        state.derived_next_attempt_at = retry_at
+        state.derived_last_error = error.strip()[:2000] or "memory derived refresh failed"
         await self.session.flush()
 
     async def renew_lease(
@@ -211,6 +284,8 @@ class MemoryIngestionStateService:
         self,
         state: MemoryIngestionState,
         message_ids: tuple[uuid.UUID, ...],
+        *,
+        outcome: MemoryIngestionOutcome | None = None,
     ) -> list[Message]:
         messages: list[Message] = []
         for message_id in dict.fromkeys(message_ids):
@@ -220,7 +295,15 @@ class MemoryIngestionStateService:
             messages.append(message)
             receipt = await self.session.get(MemoryIngestionReceipt, (state.id, message.id))
             if receipt is None:
-                self.session.add(MemoryIngestionReceipt(state_id=state.id, message_id=message.id))
+                self.session.add(
+                    MemoryIngestionReceipt(
+                        state_id=state.id,
+                        message_id=message.id,
+                        outcome=outcome or MemoryIngestionOutcome.INGESTED,
+                    )
+                )
+            elif outcome is not None and receipt.outcome != outcome:
+                raise ValueError("memory ingestion receipt outcome cannot change")
         return messages
 
 
