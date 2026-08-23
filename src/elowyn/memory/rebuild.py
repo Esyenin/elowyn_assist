@@ -17,6 +17,13 @@ class MemoryRebuildResult:
 
 
 @dataclass(frozen=True)
+class MemoryCleanupCandidate:
+    generation_id: uuid.UUID
+    bank_id: str
+    status: MemoryGenerationStatus
+
+
+@dataclass(frozen=True)
 class MemoryDiagnostics:
     backend: str
     backend_ready: bool
@@ -32,6 +39,7 @@ class MemoryDiagnostics:
     expired_processing_count: int
     building_generation_count: int
     failed_generation_count: int
+    derived_refresh_pending_count: int
 
 
 class MemoryRebuildError(RuntimeError):

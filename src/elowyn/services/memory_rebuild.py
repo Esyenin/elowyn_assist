@@ -20,6 +20,7 @@ from elowyn.db.models import (
 )
 from elowyn.domain.enums import (
     MemoryGenerationStatus,
+    MemoryIngestionOutcome,
     MemoryIngestionStatus,
     MemoryPageType,
     MessageAuthor,
@@ -27,7 +28,12 @@ from elowyn.domain.enums import (
 )
 from elowyn.memory.generation import MemoryBackendFactory
 from elowyn.memory.observations import ObservationCandidate, ObservationEvidence
-from elowyn.memory.rebuild import MemoryDiagnostics, MemoryRebuildError, MemoryRebuildResult
+from elowyn.memory.rebuild import (
+    MemoryCleanupCandidate,
+    MemoryDiagnostics,
+    MemoryRebuildError,
+    MemoryRebuildResult,
+)
 from elowyn.memory.semantics import classify_semantics
 from elowyn.memory.service import MemoryProvenance, MemoryService, RecallQuery, RetainMessage
 from elowyn.services.conversation_summary import ConversationSummaryService
@@ -156,6 +162,80 @@ class MemoryGenerationManager:
                 generation.completed_at = current_time
             await session.commit()
             return len(generations)
+
+    async def cleanup_candidates(self) -> tuple[MemoryCleanupCandidate, ...]:
+        async with self.session_factory() as session:
+            registry = await session.get(MemoryBackendRegistry, self.config.backend)
+            generations = (
+                (
+                    await session.execute(
+                        select(MemoryGeneration)
+                        .where(
+                            MemoryGeneration.backend == self.config.backend,
+                            MemoryGeneration.status.in_(
+                                (
+                                    MemoryGenerationStatus.FAILED,
+                                    MemoryGenerationStatus.SUPERSEDED,
+                                )
+                            ),
+                        )
+                        .order_by(MemoryGeneration.completed_at, MemoryGeneration.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return tuple(
+            MemoryCleanupCandidate(
+                generation_id=item.id,
+                bank_id=item.bank_id,
+                status=item.status,
+            )
+            for item in generations
+            if registry is None or registry.active_generation_id != item.id
+        )
+
+    async def cleanup_orphans(
+        self, generation_ids: tuple[uuid.UUID, ...], *, explicit: bool = False
+    ) -> tuple[uuid.UUID, ...]:
+        if not explicit:
+            raise PermissionError("memory generation cleanup requires explicit opt-in")
+        cleaned: list[uuid.UUID] = []
+        for generation_id in dict.fromkeys(generation_ids):
+            async with self.session_factory() as session:
+                registry = (
+                    await session.execute(
+                        select(MemoryBackendRegistry)
+                        .where(MemoryBackendRegistry.backend == self.config.backend)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                generation = (
+                    await session.execute(
+                        select(MemoryGeneration)
+                        .where(
+                            MemoryGeneration.id == generation_id,
+                            MemoryGeneration.backend == self.config.backend,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if generation is None:
+                    continue
+                if registry is not None and registry.active_generation_id == generation.id:
+                    raise MemoryRebuildError("active memory generation cannot be deleted")
+                if generation.status not in {
+                    MemoryGenerationStatus.FAILED,
+                    MemoryGenerationStatus.SUPERSEDED,
+                }:
+                    raise MemoryRebuildError(
+                        f"{generation.status.value} memory generation cannot be deleted"
+                    )
+                await self.factory.delete_bank(generation.bank_id)
+                await session.delete(generation)
+                await session.commit()
+                cleaned.append(generation.id)
+        return tuple(cleaned)
 
     async def rebuild(self, *, explicit: bool = False) -> MemoryRebuildResult:
         if not explicit:
@@ -492,6 +572,10 @@ class MemoryDiagnosticsService:
                         MemoryIngestionState.id == MemoryIngestionReceipt.state_id,
                     )
                     .where(MemoryIngestionState.backend == self.backend)
+                    .where(
+                        MemoryIngestionReceipt.outcome
+                        == MemoryIngestionOutcome.INGESTED
+                    )
                 )
                 or 0
             )
@@ -547,6 +631,9 @@ class MemoryDiagnosticsService:
             ),
             failed_generation_count=sum(
                 item.status == MemoryGenerationStatus.FAILED for item in generations
+            ),
+            derived_refresh_pending_count=sum(
+                state.derived_dirty_through_message_id is not None for state in states
             ),
         )
 

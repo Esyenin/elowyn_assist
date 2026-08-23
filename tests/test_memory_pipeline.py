@@ -16,7 +16,12 @@ from elowyn.db.models import (
     MemoryPage,
     Message,
 )
-from elowyn.domain.enums import MemoryIngestionStatus, MessageAuthor, TransportType
+from elowyn.domain.enums import (
+    MemoryIngestionOutcome,
+    MemoryIngestionStatus,
+    MessageAuthor,
+    TransportType,
+)
 from elowyn.memory.service import (
     MemoryHealth,
     RecallQuery,
@@ -238,6 +243,125 @@ async def test_existing_receipt_prevents_duplicate_replay(session_factory) -> No
 
 
 @pytest.mark.asyncio
+async def test_blank_and_non_text_messages_are_ignored_without_blocking_gap_catchup(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        conversation = Conversation(transport=TransportType.INTERNAL)
+        session.add(conversation)
+        await session.flush()
+        messages = [
+            Message(
+                conversation_id=conversation.id,
+                author=MessageAuthor.USER,
+                text=None,
+                raw_payload={"synthetic_attachment": True},
+                sent_at=datetime(2026, 8, 22, 11, 0, tzinfo=UTC),
+            ),
+            Message(
+                conversation_id=conversation.id,
+                author=MessageAuthor.USER,
+                text="  \n ",
+                sent_at=datetime(2026, 8, 22, 11, 1, tzinfo=UTC),
+            ),
+            Message(
+                conversation_id=conversation.id,
+                author=MessageAuthor.USER,
+                text="Synthetic memory after ignored messages.",
+                sent_at=datetime(2026, 8, 22, 11, 2, tzinfo=UTC),
+            ),
+        ]
+        session.add_all(messages)
+        await session.commit()
+    memory = RecordingMemory()
+    processor = MemoryIngestionProcessor(
+        session_factory,
+        memory,
+        MemoryPipelineConfig(backend="synthetic-v1"),
+    )
+
+    assert await processor.process_once() is True
+    async with session_factory() as session:
+        receipts = (
+            (
+                await session.execute(
+                    select(MemoryIngestionReceipt).order_by(
+                        MemoryIngestionReceipt.succeeded_at,
+                        MemoryIngestionReceipt.message_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        outcomes = {receipt.message_id: receipt.outcome for receipt in receipts}
+        assert outcomes == {
+            messages[0].id: MemoryIngestionOutcome.IGNORED_BLANK,
+            messages[1].id: MemoryIngestionOutcome.IGNORED_BLANK,
+            messages[2].id: MemoryIngestionOutcome.INGESTED,
+        }
+    assert [item.source.message_id for item, _ in memory.calls] == [messages[2].id]
+
+    async with session_factory() as session:
+        later = Message(
+            conversation_id=messages[0].conversation_id,
+            author=MessageAuthor.USER,
+            text="Later synthetic memory is still caught up.",
+            sent_at=datetime(2026, 8, 22, 11, 3, tzinfo=UTC),
+        )
+        session.add(later)
+        await session.commit()
+    assert await processor.process_once() is True
+    assert await processor.process_once() is False
+    assert [item.source.message_id for item, _ in memory.calls] == [messages[2].id, later.id]
+
+
+@pytest.mark.asyncio
+async def test_derived_refresh_failure_is_durable_and_reconciles_idempotently(
+    session_factory, monkeypatch
+) -> None:
+    _, messages = await _seed_messages(session_factory, 1)
+    memory = RecordingMemory()
+    config = MemoryPipelineConfig(
+        backend="synthetic-v1",
+        retry_base=timedelta(seconds=1),
+        retry_max=timedelta(seconds=2),
+    )
+    processor = MemoryIngestionProcessor(session_factory, memory, config)
+    original_refresh = processor._refresh_derived
+    attempts = 0
+
+    async def fail_once(claim) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("synthetic refresh failure")
+        await original_refresh(claim)
+
+    monkeypatch.setattr(processor, "_refresh_derived", fail_once)
+    started = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+
+    assert await processor.process_once(now=started) is True
+    async with session_factory() as session:
+        state = (await session.execute(select(MemoryIngestionState))).scalar_one()
+        assert state.derived_dirty_through_message_id == messages[0].id
+        assert state.derived_attempts == 1
+        assert state.derived_next_attempt_at is not None
+        assert state.derived_last_error == "RuntimeError: memory derived refresh failed"
+    assert await processor.process_once(now=started + timedelta(milliseconds=500)) is False
+    assert await processor.process_once(now=started + timedelta(seconds=2)) is True
+    assert await processor.process_once(now=started + timedelta(seconds=3)) is False
+
+    async with session_factory() as session:
+        state = (await session.execute(select(MemoryIngestionState))).scalar_one()
+        assert state.derived_dirty_through_message_id is None
+        assert state.derived_attempts == 0
+        assert state.derived_last_error is None
+        assert await session.scalar(select(func.count()).select_from(MemoryPage)) == 0
+    assert len(memory.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_partial_batch_failure_retries_only_unreceipted_messages(session_factory) -> None:
     now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
     await _seed_messages(session_factory, 3)
@@ -388,7 +512,8 @@ async def test_crash_after_receipt_before_batch_finish_does_not_retain_again(
     assert state.last_succeeded_message_id == messages[0].id
     assert receipt_count == 1
     recovered = MemoryIngestionProcessor(session_factory, memory, config)
-    assert await recovered.process_once(now=started + timedelta(seconds=2)) is False
+    assert await recovered.process_once(now=started + timedelta(seconds=2)) is True
+    assert await recovered.process_once(now=started + timedelta(seconds=3)) is False
     state, receipt_count = await _state_snapshot(session_factory)
     assert state.status == MemoryIngestionStatus.IDLE
     assert state.last_succeeded_message_id == messages[0].id

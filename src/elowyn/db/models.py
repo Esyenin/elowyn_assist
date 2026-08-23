@@ -30,6 +30,7 @@ from elowyn.domain.enums import (
     EvidenceStance,
     GoalStatus,
     MemoryGenerationStatus,
+    MemoryIngestionOutcome,
     MemoryIngestionStatus,
     MemoryPageType,
     MessageAuthor,
@@ -163,6 +164,9 @@ class MemoryIngestionState(Base):
         CheckConstraint("length(trim(backend)) > 0", name="ck_memory_backend_not_blank"),
         CheckConstraint("attempts >= 0", name="ck_memory_ingestion_attempts"),
         CheckConstraint(
+            "derived_attempts >= 0", name="ck_memory_ingestion_derived_attempts"
+        ),
+        CheckConstraint(
             "(status = 'PROCESSING' AND lease_expires_at IS NOT NULL) OR "
             "(status <> 'PROCESSING' AND lease_expires_at IS NULL)",
             name="ck_memory_ingestion_lease_consistent",
@@ -191,6 +195,14 @@ class MemoryIngestionState(Base):
         DateTime(timezone=True), nullable=True
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    derived_dirty_through_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    derived_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    derived_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    derived_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -209,6 +221,11 @@ class MemoryIngestionReceipt(Base):
     )
     message_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    outcome: Mapped[MemoryIngestionOutcome] = mapped_column(
+        enum_type(MemoryIngestionOutcome, name="memory_ingestion_outcome"),
+        default=MemoryIngestionOutcome.INGESTED,
+        nullable=False,
     )
     succeeded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

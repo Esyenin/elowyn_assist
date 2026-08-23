@@ -20,7 +20,12 @@ from elowyn.memory.observations import (
     ObservationEvidenceView,
     ObservationView,
 )
-from elowyn.memory.rebuild import MemoryDiagnostics, MemoryRebuildError, MemoryRebuildResult
+from elowyn.memory.rebuild import (
+    MemoryCleanupCandidate,
+    MemoryDiagnostics,
+    MemoryRebuildError,
+    MemoryRebuildResult,
+)
 from elowyn.memory.service import (
     EpistemicStatus,
     MemoryProvenance,
@@ -43,6 +48,7 @@ __all__ = [
     "HindsightConfig",
     "MemoryProvenance",
     "MemoryBackendFactory",
+    "MemoryCleanupCandidate",
     "MemoryDiagnostics",
     "MemoryPageEntry",
     "MemoryPageView",
