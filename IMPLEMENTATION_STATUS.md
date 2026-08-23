@@ -8,9 +8,10 @@ TelegramAdapter → Pydantic AI → NVIDIA Nemotron → domain tools → least-p
 PostgreSQL → Telegram response`. Функциональных runtime gates до release v0.1.0 не осталось;
 merge feature-ветки и release tag выполняются только отдельными командами.
 
-Memory v0.2 Slice 1–10 реализованы в `codex/memory-v0.2`; behavioral acceptance прошёл
-13/13 на real Hindsight 0.9.1, а общий release gate — 130/130 без skip. Детали и честные
-ограничения зафиксированы в `docs/specs/V0_2_ACCEPTANCE.md`. Ветка не merge-нута, tag не создан.
+Memory v0.2 Slice 1–10 merge-нуты в `main` explicit non-fast-forward merge; behavioral
+acceptance прошёл 13/13 на real Hindsight 0.9.1, а main release gate — 130/130 без skip.
+Детали, rebuild/recovery result и честные ограничения зафиксированы в
+`docs/specs/V0_2_ACCEPTANCE.md`.
 
 ## Реализовано
 

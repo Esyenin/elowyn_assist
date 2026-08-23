@@ -49,3 +49,16 @@ The only production defect found during Slice 10 was that successful normal inge
 not refresh Elowyn-owned summaries/observations/pages until a rebuild. Derived refresh now
 runs after confirmed ingestion, outside the user-turn critical path; a targeted regression
 test covers repeated preference page creation.
+
+## Release finalization
+
+The feature branch was merged into `main` with an explicit non-fast-forward merge. Main
+GitHub Actions run `32607159970` passed the same release gates: 127 non-Hindsight tests and
+3 mandatory real-Hindsight tests, with zero skips/xfails/xpasses.
+
+The optional post-CI real-world Conversation A → Conversation B smoke was not run locally.
+Telegram Bot API and the hosted runtime model were configured, but this workstation had no
+Docker runtime and no configured Hindsight endpoint/bank or real Hindsight LLM provider.
+No credentials, provider, framework, or architecture changes were introduced solely for the
+smoke. This does not replace or weaken the passing real Hindsight and synthetic Telegram
+multi-session acceptance gates above.
