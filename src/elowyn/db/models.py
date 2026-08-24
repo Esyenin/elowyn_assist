@@ -10,12 +10,15 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,6 +38,10 @@ from elowyn.domain.enums import (
     MemoryPageType,
     MessageAuthor,
     ObservationStatus,
+    PlanGoalRole,
+    PlanItemProgressStatus,
+    PlanVersionBasisRole,
+    PlanVersionStatus,
     ProjectStatus,
     RelationType,
     SemanticCategory,
@@ -852,4 +859,278 @@ class EntityRelation(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class Strategy(Base):
+    """Stable canonical identity for the strategy accepted with an approved PlanVersion."""
+
+    __tablename__ = "strategies"
+    __table_args__ = (
+        CheckConstraint("length(trim(approach)) > 0", name="ck_strategy_approach_not_blank"),
+    )
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("entities.id", ondelete="CASCADE"), primary_key=True
+    )
+    approach: Mapped[str] = mapped_column(Text, nullable=False)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    accepted_from_plan_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(
+            "plan_versions.id",
+            name="fk_strategies_accepted_plan_version",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        nullable=False,
+    )
+    accepted_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class Plan(Base):
+    """Stable identity for one logical lineage of user-visible plan versions."""
+
+    __tablename__ = "plans"
+    __table_args__ = (
+        CheckConstraint("length(trim(title)) > 0", name="ck_plan_title_not_blank"),
+    )
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("entities.id", ondelete="CASCADE"), primary_key=True
+    )
+    strategy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("strategies.entity_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PlanGoalLink(Base):
+    __tablename__ = "plan_goal_links"
+    __table_args__ = (
+        Index(
+            "uq_plan_goal_primary",
+            "plan_id",
+            unique=True,
+            postgresql_where=text("role = 'PRIMARY'"),
+            sqlite_where=text("role = 'PRIMARY'"),
+        ),
+    )
+
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plans.entity_id", ondelete="CASCADE"), primary_key=True
+    )
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("goals.entity_id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[PlanGoalRole] = mapped_column(
+        enum_type(PlanGoalRole, name="plan_goal_role"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PlanVersion(Base):
+    """Immutable content version; only lifecycle and approval metadata may change."""
+
+    __tablename__ = "plan_versions"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "version_number", name="uq_plan_version_number"),
+        UniqueConstraint("plan_id", "id", name="uq_plan_version_identity"),
+        CheckConstraint("version_number > 0", name="ck_plan_version_number_positive"),
+        CheckConstraint("length(trim(summary)) > 0", name="ck_plan_version_summary_not_blank"),
+        CheckConstraint(
+            "length(trim(proposed_strategy_snapshot)) > 0",
+            name="ck_plan_version_strategy_not_blank",
+        ),
+        CheckConstraint(
+            "based_on_version_id IS NULL OR based_on_version_id <> id",
+            name="ck_plan_version_not_based_on_self",
+        ),
+        CheckConstraint(
+            "(approval_source_id IS NULL AND approved_at IS NULL) OR "
+            "(approval_source_id IS NOT NULL AND approved_at IS NOT NULL)",
+            name="ck_plan_version_approval_pair",
+        ),
+        CheckConstraint(
+            "status <> 'APPROVED' OR "
+            "(approval_source_id IS NOT NULL AND approved_at IS NOT NULL)",
+            name="ck_plan_version_approved_metadata",
+        ),
+        CheckConstraint(
+            "status NOT IN ('CANDIDATE', 'REJECTED') OR "
+            "(approval_source_id IS NULL AND approved_at IS NULL)",
+            name="ck_plan_version_unapproved_metadata",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id", "based_on_version_id"],
+            ["plan_versions.plan_id", "plan_versions.id"],
+            name="fk_plan_version_based_on_same_plan",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "uq_plan_version_current_candidate",
+            "plan_id",
+            unique=True,
+            postgresql_where=text("status = 'CANDIDATE'"),
+            sqlite_where=text("status = 'CANDIDATE'"),
+        ),
+        Index(
+            "uq_plan_version_current_approved",
+            "plan_id",
+            unique=True,
+            postgresql_where=text("status = 'APPROVED'"),
+            sqlite_where=text("status = 'APPROVED'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plans.entity_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[PlanVersionStatus] = mapped_column(
+        enum_type(PlanVersionStatus, name="plan_version_status"), nullable=False, index=True
+    )
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposed_strategy_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    strategy_rationale_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    based_on_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    created_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    approval_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="RESTRICT"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PlanVersionItem(Base):
+    __tablename__ = "plan_version_items"
+    __table_args__ = (
+        UniqueConstraint("plan_version_id", "ordinal", name="uq_plan_version_item_ordinal"),
+        UniqueConstraint("plan_version_id", "id", name="uq_plan_version_item_identity"),
+        CheckConstraint("ordinal > 0", name="ck_plan_version_item_ordinal_positive"),
+        CheckConstraint("length(trim(title)) > 0", name="ck_plan_version_item_title_not_blank"),
+        CheckConstraint(
+            "estimated_duration_minutes IS NULL OR estimated_duration_minutes > 0",
+            name="ck_plan_version_item_duration_positive",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    plan_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plan_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    estimated_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    linked_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("tasks.entity_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+
+class PlanVersionItemDependency(Base):
+    __tablename__ = "plan_version_item_dependencies"
+    __table_args__ = (
+        CheckConstraint(
+            "prerequisite_item_id <> dependent_item_id",
+            name="ck_plan_version_item_dependency_not_self",
+        ),
+        ForeignKeyConstraint(
+            ["plan_version_id", "prerequisite_item_id"],
+            ["plan_version_items.plan_version_id", "plan_version_items.id"],
+            name="fk_plan_item_dependency_prerequisite",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["plan_version_id", "dependent_item_id"],
+            ["plan_version_items.plan_version_id", "plan_version_items.id"],
+            name="fk_plan_item_dependency_dependent",
+            ondelete="CASCADE",
+        ),
+    )
+
+    plan_version_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    prerequisite_item_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    dependent_item_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+
+
+class PlanItemProgress(Base):
+    __tablename__ = "plan_item_progress"
+
+    plan_version_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plan_version_items.id", ondelete="CASCADE"), primary_key=True
+    )
+    status: Mapped[PlanItemProgressStatus] = mapped_column(
+        enum_type(PlanItemProgressStatus, name="plan_item_progress_status"), nullable=False
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PlanVersionPresentation(Base):
+    __tablename__ = "plan_version_presentations"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_version_id", "message_id", name="uq_plan_version_presentation_message"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    plan_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plan_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    presented_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PlanVersionBasis(Base):
+    __tablename__ = "plan_version_basis"
+
+    plan_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plan_versions.id", ondelete="CASCADE"), primary_key=True
+    )
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("entities.id", ondelete="RESTRICT"), primary_key=True
+    )
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("events.id", ondelete="RESTRICT"), primary_key=True
+    )
+    role: Mapped[PlanVersionBasisRole] = mapped_column(
+        enum_type(PlanVersionBasisRole, name="plan_version_basis_role"), primary_key=True
     )

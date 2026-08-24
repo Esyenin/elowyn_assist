@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import Enum
-from functools import wraps
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy import update as sqlalchemy_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +21,6 @@ from elowyn.db.models import (
     Project,
     ProjectGoalLink,
     Source,
-    SourceDependency,
     SuccessCriterion,
     Task,
     TaskDependency,
@@ -58,86 +55,27 @@ from elowyn.domain.enums import (
     EventType,
     GoalStatus,
     ProjectStatus,
-    SourceType,
     SuccessCriterionStatus,
     TaskStatus,
 )
 from elowyn.domain.errors import DomainValidationError, EntityNotFoundError
+from elowyn.services.domain_mutation import (
+    ActionContext,
+    DomainMutationService,
+    atomic_domain_action,
+    change,
+    json_value,
+)
+from elowyn.services.domain_mutation import (
+    assistant_inference_source as shared_assistant_inference_source,
+)
+
+_change = change
+_json_value = json_value
 
 
-def atomic_domain_action(method):
-    """Rollback a failed tool call to a SAVEPOINT without discarding the whole user turn."""
-
-    @wraps(method)
-    async def wrapped(self, *args, **kwargs):
-        exclusive = method.__name__ == "undo_last_change" and kwargs.get("entity_id") is None
-        await self._lock_world_state(exclusive=exclusive)
-        async with self.session.begin_nested():
-            return await method(self, *args, **kwargs)
-
-    return wrapped
-
-
-@dataclass(frozen=True)
-class ActionContext:
-    actor_type: ActorType
-    source: Source | None = None
-    description: str | None = None
-    operation_id: uuid.UUID | None = None
-
-
-def _json_value(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, (datetime, uuid.UUID)):
-        return str(value)
-    if isinstance(value, list):
-        return [_json_value(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _json_value(item) for key, item in value.items()}
-    return value
-
-
-def _change(field: str, old: Any, new: Any) -> dict[str, Any]:
-    return {"field": field, "old": _json_value(old), "new": _json_value(new)}
-
-
-class WorldStateService:
+class WorldStateService(DomainMutationService):
     """Validated write boundary between the LLM/tool layer and persistent state."""
-
-    def __init__(self, session: AsyncSession):
-        self.session = session
-        self._last_event_at: datetime | None = None
-
-    def _uses_postgresql(self) -> bool:
-        get_bind = getattr(self.session, "get_bind", None)
-        if get_bind is not None:
-            return get_bind().dialect.name == "postgresql"
-        sync_session = getattr(self.session, "sync", None)
-        return sync_session is not None and sync_session.get_bind().dialect.name == "postgresql"
-
-    async def _lock_world_state(self, *, exclusive: bool) -> None:
-        """Coordinate global undo with concurrent domain actions for this transaction."""
-
-        if not self._uses_postgresql():
-            return
-        function = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
-        await self.session.execute(text(f"SELECT {function}(5044031582654955025)"))
-
-    async def _lock_entities(self, entity_ids: list[uuid.UUID]) -> None:
-        """Lock identities in UUID order so concurrent multi-row actions cannot deadlock."""
-
-        ordered_ids = sorted(set(entity_ids))
-        if not ordered_ids or not self._uses_postgresql():
-            return
-        with self.session.no_autoflush:
-            await self.session.execute(
-                select(Entity)
-                .where(Entity.id.in_(ordered_ids))
-                .order_by(Entity.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
 
     async def _lock_typed_graph(
         self,
@@ -164,22 +102,6 @@ class WorldStateService:
                 .execution_options(populate_existing=True)
             )
 
-    async def _operation(self, ctx: ActionContext) -> Operation:
-        if ctx.operation_id is not None:
-            existing = await self.session.get(Operation, ctx.operation_id)
-            if existing is not None:
-                return existing
-
-        op = Operation(
-            id=ctx.operation_id if ctx.operation_id is not None else uuid.uuid4(),
-            actor_type=ctx.actor_type,
-            source_id=ctx.source.id if ctx.source else None,
-            description=ctx.description,
-        )
-        self.session.add(op)
-        await self.session.flush()
-        return op
-
     async def _entity(self, entity_type: EntityType) -> Entity:
         entity = Entity(entity_type=entity_type)
         self.session.add(entity)
@@ -204,22 +126,14 @@ class WorldStateService:
                 current_summary_updated_at=None,
             )
         )
-        created_at = datetime.now(UTC)
-        if self._last_event_at is not None and created_at <= self._last_event_at:
-            created_at = self._last_event_at + timedelta(microseconds=1)
-        self._last_event_at = created_at
-        event = Event(
-            operation_id=operation.id,
+        return await self._append_event(
+            operation=operation,
             event_type=event_type,
             entity_id=entity_id,
-            source_id=source.id if source else None,
+            source=source,
             reverses_event_id=reverses_event_id,
             changes=changes,
-            created_at=created_at,
         )
-        self.session.add(event)
-        await self.session.flush()
-        return event
 
     async def _active_entity(
         self,
@@ -1372,19 +1286,9 @@ async def assistant_inference_source(
     reason_summary: str,
     evidence_source: Source | None = None,
 ) -> Source:
-    if not 0 <= confidence <= 1:
-        raise DomainValidationError("assistant inference confidence must be between 0 and 1")
-    if not reason_summary.strip():
-        raise DomainValidationError("assistant inference requires reason_summary")
-
-    source = Source(
-        source_type=SourceType.ASSISTANT_INFERENCE,
+    return await shared_assistant_inference_source(
+        session,
         confidence=confidence,
-        reason_summary=reason_summary.strip(),
+        reason_summary=reason_summary,
+        evidence_sources=[evidence_source] if evidence_source is not None else [],
     )
-    session.add(source)
-    await session.flush()
-    if evidence_source is not None:
-        session.add(SourceDependency(source_id=source.id, evidence_source_id=evidence_source.id))
-        await session.flush()
-    return source

@@ -27,6 +27,11 @@ INSERT_ONLY_TABLES = (
     "project_goal_links",
     "task_dependencies",
     "entity_relations",
+    "plan_goal_links",
+    "plan_version_items",
+    "plan_version_item_dependencies",
+    "plan_version_presentations",
+    "plan_version_basis",
 )
 MUTABLE_COLUMNS = {
     "entities": ("superseded_by_entity_id", "updated_at"),
@@ -78,6 +83,17 @@ MUTABLE_COLUMNS = {
         "updated_at",
     ),
     "decisions": ("status",),
+    "plans": ("strategy_id", "updated_at"),
+    "strategies": (
+        "approach",
+        "rationale",
+        "accepted_from_plan_version_id",
+        "accepted_source_id",
+        "accepted_at",
+        "updated_at",
+    ),
+    "plan_versions": ("status", "approval_source_id", "approved_at"),
+    "plan_item_progress": ("status", "note", "source_id", "updated_at"),
 }
 
 

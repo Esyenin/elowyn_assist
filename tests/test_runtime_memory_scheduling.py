@@ -29,6 +29,24 @@ class FakeSession:
     async def rollback(self) -> None:
         self.rollbacks += 1
 
+    async def get(self, model, ident):
+        return SimpleNamespace(id=ident)
+
+    def begin(self):
+        session = self
+
+        class Transaction:
+            async def __aenter__(self):
+                return session
+
+            async def __aexit__(self, exc_type, exc, tb):
+                if exc_type is None:
+                    session.commits += 1
+                else:
+                    session.rollbacks += 1
+
+        return Transaction()
+
 
 class FakeConversationService:
     def __init__(self, session: FakeSession) -> None:
@@ -62,6 +80,14 @@ class FakeQueryService:
         return "synthetic world state"
 
 
+class FakePlanningQueryService:
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    async def render_for_agent(self) -> str:
+        return '{"plans": []}'
+
+
 class FakeAgent:
     async def run(self, prompt: str) -> object:
         return SimpleNamespace(output="synthetic assistant response")
@@ -80,6 +106,8 @@ async def test_turn_commits_and_returns_when_memory_wakeup_fails(monkeypatch) ->
     monkeypatch.setattr(runtime_module, "ConversationService", FakeConversationService)
     monkeypatch.setattr(runtime_module, "WorldStateQueryService", FakeQueryService)
     monkeypatch.setattr(runtime_module, "WorldStateService", lambda session: object())
+    monkeypatch.setattr(runtime_module, "PlanningService", lambda session: object())
+    monkeypatch.setattr(runtime_module, "PlanningQueryService", FakePlanningQueryService)
     monkeypatch.setattr(runtime_module, "build_agent", lambda **kwargs: FakeAgent())
     monkeypatch.setattr(runtime_module, "build_turn_prompt", lambda **kwargs: "synthetic prompt")
     runtime = ElowynRuntime(

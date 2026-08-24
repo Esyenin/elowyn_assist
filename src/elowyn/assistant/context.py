@@ -22,6 +22,7 @@ def build_turn_prompt(
     world_state: str,
     history: list[Message],
     memory_context: BoundedMemoryContext | None = None,
+    planning_context: str | None = None,
     current_time: datetime | None = None,
 ) -> str:
     history_lines: list[str] = []
@@ -34,6 +35,12 @@ def build_turn_prompt(
     memory_text = ""
     if memory_context is not None and memory_context.text:
         memory_text = f"\n{memory_context.text}\n"
+    planning_text = ""
+    if planning_context:
+        planning_text = (
+            "\nТЕКУЩЕЕ PLANNING STATE (authoritative; bounded; internal IDs не показывай):\n"
+            f"{planning_context}\n"
+        )
 
     now = current_time or datetime.now(UTC)
     return f"""ТЕКУЩАЯ ДАТА И ВРЕМЯ (для относительных дат):
@@ -45,6 +52,7 @@ def build_turn_prompt(
 ПОСЛЕДНИЙ КОНТЕКСТ РАЗГОВОРА:
 {history_text}
 {memory_text}
+{planning_text}
 
 НОВОЕ СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:
 {user_text}

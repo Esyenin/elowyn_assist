@@ -33,6 +33,15 @@ EXPECTED_TABLES = {
     "memory_observation_evidence",
     "memory_pages",
     "memory_page_observations",
+    "strategies",
+    "plans",
+    "plan_goal_links",
+    "plan_versions",
+    "plan_version_items",
+    "plan_version_item_dependencies",
+    "plan_item_progress",
+    "plan_version_presentations",
+    "plan_version_basis",
 }
 
 

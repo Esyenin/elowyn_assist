@@ -1,19 +1,33 @@
-# Implementation and DB safety status — 2026-08-22
+# Implementation and DB safety status — 2026-08-24
 
 ## Текущий статус
 
-Функциональный contract v0.1 и DB safety phases 1–6 подтверждены локально на реальном PostgreSQL.
-Deterministic E2E и реальный hosted-provider vertical подтверждены: `Telegram Bot API/polling →
-TelegramAdapter → Pydantic AI → NVIDIA Nemotron → domain tools → least-privilege runtime role →
-PostgreSQL → Telegram response`. Функциональных runtime gates до release v0.1.0 не осталось;
-merge feature-ветки и release tag выполняются только отдельными командами.
+Текущий стабильный релиз: **v0.3.0 — Strategy and Planning**. Фундамент v0.1 Core/World State и
+Memory v0.2.1 сохранены; v0.3 добавляет версионируемые пользовательские планы, явное утверждение
+конкретно показанной Candidate, атомарное принятие Strategy, Progress, Next Action и объяснимую
+историю. Следующий этап: **v0.4 — dynamic replanning** без молчаливой замены Approved Plan.
 
-Memory v0.2 Slice 1–10 merge-нуты в `main` explicit non-fast-forward merge; behavioral
-acceptance прошёл 13/13 на real Hindsight 0.9.1, а main release gate — 130/130 без skip.
-Детали, rebuild/recovery result и честные ограничения зафиксированы в
-`docs/specs/V0_2_ACCEPTANCE.md`.
+Финальный v0.3 release-readiness gate: **218 passed, 3 real-Hindsight tests deselected**;
+deterministic E2E, concurrency, rollback, restart persistence, migrations, permissions,
+ConsistencyVerifier, Ruff, MyPy, compileall и secret audit — PASS. Real hosted model planning и
+real Telegram Bot API multi-turn — PASS. Real Hindsight локально **NOT RUN**, потому что Docker
+runtime недоступен; это не обозначается как PASS.
 
 ## Реализовано
+
+- Planning v0.3: стабильные Strategy/Plan identities и immutable PlanVersion content/history.
+- Состояния Candidate/Approved/Rejected/Superseded с максимум одной current Candidate и одной
+  current Approved на Plan; Candidate и Approved могут безопасно сосуществовать.
+- Canonical `PlanVersionPresentation → assistant Message` и approval authority через конкретный
+  последующий `USER_MESSAGE`; неоднозначное или частичное согласие не утверждает Plan.
+- Approval атомарно supersede-ит предыдущую Approved, принимает Strategy snapshot и инициализирует
+  Progress; Plan approval не создаёт и не меняет Task/Project/Goal/Decision.
+- Раздельные immutable PlanVersionItem и mutable PlanItemProgress; deterministic Next Action учитывает
+  Progress и зависимости и не является scheduler/optimizer.
+- Bounded current Planning Context, explicit bounded history/version/diff reads и canonical
+  Source/Operation/Event provenance для объяснения изменений.
+- `PlanVersionBasis(entity_id, event_id, role)` и read-only staleness detection без automatic
+  replanning, impact claims или hidden mutation.
 
 - Исполняемая ORM-схема v0.1: 17 таблиц + Alembic `0001_initial`.
 - Thin `Entity` identity + typed Task/Project/Goal/Decision tables.
@@ -111,6 +125,19 @@ acceptance прошёл 13/13 на real Hindsight 0.9.1, а main release gate �
 
 ## Проверено в текущем окружении
 
+- Финальный v0.3 suite: **218 passed, 3 real-Hindsight tests deselected**; skip/xfail/xpass в
+  обязательном non-Hindsight наборе отсутствуют.
+- Deterministic runtime E2E: Goal + relevant non-authoritative Memory → Candidate presentation →
+  revision → natural approval → atomic Strategy → Progress/Next Action → history/diff → staleness →
+  restart persistence — **PASS**.
+- Planning concurrency, transaction rollback, PostgreSQL constraints, least-privilege permissions и
+  ConsistencyVerifier на нормальном/повреждённом state — **PASS**.
+- Alembic `upgrade → downgrade → upgrade`, recovery drill, Ruff, MyPy, compileall, secret audit и
+  `git diff --check` — **PASS**.
+- Real hosted model Planning и real Telegram Bot API multi-turn — **PASS** на synthetic data.
+- Real Hindsight 0.9.1 — **NOT RUN** локально: Docker runtime недоступен. Прежние v0.2 acceptance
+  результаты не переименованы в текущий локальный PASS.
+
 - PostgreSQL: **18.3**, отдельный acceptance cluster на `127.0.0.1:55433`.
 - `alembic downgrade base && alembic upgrade head`: **OK** на PostgreSQL.
 - Acceptance 1–9: **9 passed**.
@@ -143,8 +170,8 @@ acceptance прошёл 13/13 на real Hindsight 0.9.1, а main release gate �
 
 - Secret Scanning / Push Protection: `gh` отсутствует, unauthenticated GitHub API эту настройку не
   раскрывает.
-- GitHub Actions на feature-ветке после runtime gate: Ruff/mypy, полный PostgreSQL suite и recovery
-  drill — **OK**; ветка ещё не merge-нута в `main`.
+- Real Hindsight integration не повторялся локально для v0.3 из-за отсутствия Docker; Memory backend
+  и его v0.2.1 contract в v0.3 не изменялись.
 
 ## Полученные safety guarantees
 
@@ -171,5 +198,7 @@ acceptance прошёл 13/13 на real Hindsight 0.9.1, а main release gate �
 
 ## Неблокирующая заметка для roadmap
 
-Перед переходом к нескольким concurrent workers разумно добавить DB-backed порядковый ключ/sequence
-для глобального causal ordering Event. Текущая схема этому не препятствует.
+Следующий этап — **v0.4 dynamic replanning**: анализировать влияние изменений World State на
+Plan/Strategy и при необходимости предлагать новую Candidate. Даже в v0.4 такая Candidate не должна
+молча заменять действующую Approved. Automatic scheduling, Run/Worker и resource optimization в
+v0.3 не реализованы.
