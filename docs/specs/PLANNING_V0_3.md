@@ -1,6 +1,6 @@
 # Elowyn v0.3 — Strategy and Planning implementation contract
 
-Status: **IMPLEMENTED / RELEASE-READY FOR v0.3.0**
+Status: **IMPLEMENTED / ACCEPTANCE-HARDENED FOR v0.3.1**
 
 Source: the current project master, the working v0.2.1 implementation and migrations, the
 pre-v0.3 technical audit, and the accepted v0.3 product decisions. If older planning notes
@@ -125,7 +125,10 @@ CANDIDATE
 APPROVED
  └─→ SUPERSEDED
 
-SUPERSEDED — terminal
+SUPERSEDED (formerly APPROVED)
+ └─→ APPROVED, only after canonical presentation and explicit user confirmation
+
+SUPERSEDED (formerly CANDIDATE) — terminal
 REJECTED   — terminal
 ```
 
@@ -139,7 +142,7 @@ Per Plan:
   lineage;
 - a material edit to a presented version creates a new monotonically increasing `version_number`;
 - historical PlanVersion content is never overwritten;
-- terminal versions never return to Candidate or Approved.
+- a formerly Approved version may return only to Approved; it never returns to Candidate.
 
 ## 6. Version history and return to an old variant
 
@@ -153,9 +156,12 @@ possible to determine:
 - which version was previously current and which versions are current now;
 - the Source/Operation/Event provenance of every state transition.
 
-An historical version is never reactivated. If the user asks to return to an older variant, Elowyn
-creates and presents a new Candidate based on that historical version. The original remains
-unchanged.
+A formerly Approved historical version is shown canonically before return. Explicit confirmation
+reactivates that exact PlanVersion without copying or changing its identity/content. The current
+Approved becomes `SUPERSEDED`, Strategy is accepted from the reactivated version's immutable
+snapshot, existing progress remains attached to its original items, and Event/Source history records
+the activation sequence (for example `v2 → v4 → v2`). A later material edit creates a new Candidate
+based on the reactivated version; the return itself does not.
 
 ## 7. Presentation binding
 
@@ -214,6 +220,10 @@ Neither of these intermediate states may commit:
 
 Approval never invokes automatic Task, Project, Goal, or Decision mutations. A retry for the same
 approval evidence must be idempotent or fail safely without producing a second logical transition.
+
+Reactivation uses the same atomic Strategy/current-Approved boundary, requires an exact historical
+presentation plus explicit USER_MESSAGE confirmation, preserves the version's original approval
+metadata and progress, and appends new Event/Source provenance for the reactivation.
 
 ## 10. Progress
 

@@ -1,4 +1,4 @@
-# Elowyn v0.3.0
+# Elowyn v0.3.1
 
 Персональный AI-ассистент с canonical World State, долговременной памятью и согласуемыми
 версионируемыми планами:
@@ -7,7 +7,7 @@
 
 v0.1 заложил Core/World State, v0.2–v0.2.1 добавили rebuildable Long-term Memory, а v0.3 добавляет
 Strategy → Candidate Plan → canonical Presentation → explicit approval → Progress/Next Action.
-Текущий стабильный релиз — **v0.3.0**; следующий этап — **v0.4 dynamic replanning**.
+Текущий стабильный релиз — **v0.3.1**; следующий этап — **v0.4 dynamic replanning**.
 
 v0.3 не содержит automatic replanning, impact analysis, proactive invalidation, Schedule,
 resource optimization или Run/Worker lifecycle.

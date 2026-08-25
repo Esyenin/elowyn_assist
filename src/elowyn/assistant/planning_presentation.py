@@ -77,7 +77,33 @@ def _format_datetime(value: datetime) -> str:
     return value.isoformat(timespec="minutes")
 
 
-async def render_plan_version(session: AsyncSession, version_id: uuid.UUID) -> str:
+def _status_label(version: PlanVersion) -> str:
+    return {
+        "CANDIDATE": "предложенная",
+        "APPROVED": "утверждённая",
+        "SUPERSEDED": "историческая",
+        "REJECTED": "отклонённая",
+    }[version.status.value]
+
+
+def _item_count_label(count: int) -> str:
+    if 11 <= count % 100 <= 14:
+        noun = "пунктов"
+    elif count % 10 == 1:
+        noun = "пункт"
+    elif 2 <= count % 10 <= 4:
+        noun = "пункта"
+    else:
+        noun = "пунктов"
+    return f"{count} {noun}"
+
+
+async def render_plan_version(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+    *,
+    compact: bool = False,
+) -> str:
     """Render exact immutable Candidate content without exposing internal identifiers."""
 
     version = await session.get(PlanVersion, version_id)
@@ -115,12 +141,37 @@ async def render_plan_version(session: AsyncSession, version_id: uuid.UUID) -> s
             ordinal_by_id[dependency.prerequisite_item_id]
         )
 
-    lines = [plan.title, "", "Стратегия:", version.proposed_strategy_snapshot]
+    lines = [
+        f"План — версия {version.version_number} ({_status_label(version)})",
+        (
+            "Название линии (может не отражать срок этой версии): "
+            f"{plan.title}"
+        ),
+        "",
+        "Кратко:",
+        version.summary,
+        "",
+        "Сохранённая стратегия этой версии:",
+        version.proposed_strategy_snapshot,
+    ]
+    if compact:
+        lines.extend(["", f"Пункты ({len(items)}):"])
+        lines.extend(f"{item.ordinal}. {item.title}" for item in items)
+        return "\n".join(lines).strip()
     if version.strategy_rationale_snapshot:
         lines.extend(["", "Почему:", version.strategy_rationale_snapshot])
     if version.rationale:
         lines.extend(["", "Обоснование плана:", version.rationale])
-    lines.extend(["", "План:"])
+    lines.extend(
+        [
+            "",
+            (
+                "Пункты ниже — canonical состав версии; если свободный текст стратегии "
+                "расходится с ними, ориентируйся на эти пункты."
+            ),
+            f"План ({_item_count_label(len(items))}):",
+        ]
+    )
     for item in items:
         line = f"{item.ordinal}. {item.title}"
         details: list[str] = []
@@ -134,8 +185,12 @@ async def render_plan_version(session: AsyncSession, version_id: uuid.UUID) -> s
             details.append(f"Оценка: {item.estimated_duration_minutes} мин.")
         required = sorted(prerequisites.get(item.id, []))
         if required:
-            details.append("После пунктов: " + ", ".join(str(value) for value in required))
+            if len(required) == 1:
+                details.append(f"После пункта {required[0]}")
+            else:
+                details.append("После пунктов " + ", ".join(str(value) for value in required))
         if details:
-            line += " — " + "; ".join(details)
+            line += "\n   " + "\n   ".join(details)
         lines.append(line)
+        lines.append("")
     return "\n".join(lines).strip()

@@ -8,9 +8,19 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from elowyn.db.models import Conversation, Message, PlanVersion, Source, Strategy
+from elowyn.db.models import (
+    Conversation,
+    Event,
+    Message,
+    PlanVersion,
+    PlanVersionItem,
+    PlanVersionItemDependency,
+    Source,
+    Strategy,
+)
 from elowyn.domain.enums import (
     ActorType,
+    EventType,
     MessageAuthor,
     PlanVersionStatus,
     SourceType,
@@ -22,6 +32,7 @@ from elowyn.domain.planning_commands import (
     PlanCreate,
     PlanVersionApprove,
     PlanVersionItemCreate,
+    PlanVersionItemDependencyCreate,
     PlanVersionPresentationCreate,
 )
 from elowyn.services.domain_mutation import ActionContext
@@ -108,6 +119,51 @@ async def seed_presented_candidate(factory):
         return plan_id, result
 
 
+async def seed_approved_with_current_candidate(factory):
+    plan_id, seeded = await seed_presented_candidate(factory)
+    approved_id, evidence_id, approval_id, _ = seeded
+    async with factory() as session:
+        approval = await session.get(Source, approval_id)
+        evidence = await session.get(Source, evidence_id)
+        service = PlanningService(session)
+        await service.approve_plan_version(
+            PlanVersionApprove(plan_version_id=approved_id),
+            ActionContext(ActorType.USER, approval),
+        )
+        first = PlanVersionItemCreate(ordinal=1, title="Draft summary")
+        second = PlanVersionItemCreate(ordinal=2, title="Final rehearsal")
+        current = await service.create_candidate_version(
+            PlanCandidateCreate(
+                plan_id=plan_id,
+                summary="Current three-week Candidate",
+                proposed_strategy_snapshot="Practice for three weeks",
+                based_on_version_id=approved_id,
+                items=[first, second],
+                dependencies=[
+                    PlanVersionItemDependencyCreate(
+                        prerequisite_item_id=first.id,
+                        dependent_item_id=second.id,
+                    )
+                ],
+            ),
+            ActionContext(ActorType.ASSISTANT, evidence),
+        )
+        current_items = list(
+            (
+                await session.execute(
+                    select(PlanVersionItem)
+                    .where(PlanVersionItem.plan_version_id == current.id)
+                    .order_by(PlanVersionItem.ordinal)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        result = approved_id, current.id, evidence_id, [item.id for item in current_items]
+        await session.commit()
+        return plan_id, result
+
+
 async def test_two_candidate_creations_serialize_version_numbers(safety_engine) -> None:
     factory = async_sessionmaker(safety_engine, expire_on_commit=False)
     plan_id, _, evidence_id = await seed_plan(factory)
@@ -149,6 +205,140 @@ async def test_two_candidate_creations_serialize_version_numbers(safety_engine) 
             PlanVersionStatus.SUPERSEDED,
             PlanVersionStatus.CANDIDATE,
         ]
+
+
+async def test_postgres_revision_remaps_reused_historical_item_ids(safety_engine) -> None:
+    factory = async_sessionmaker(safety_engine, expire_on_commit=False)
+    plan_id, seeded = await seed_approved_with_current_candidate(factory)
+    approved_id, current_id, evidence_id, historical_ids = seeded
+    async with factory() as session:
+        evidence = await session.get(Source, evidence_id)
+        revision = await PlanningService(session).create_candidate_version(
+            PlanCandidateCreate(
+                plan_id=plan_id,
+                summary="Candidate with revised final day",
+                proposed_strategy_snapshot="Practice, then oral rehearsal",
+                based_on_version_id=current_id,
+                items=[
+                    PlanVersionItemCreate(
+                        id=historical_ids[0], ordinal=1, title="Oral rehearsal"
+                    ),
+                    PlanVersionItemCreate(
+                        id=historical_ids[1], ordinal=2, title="Short key-ideas list"
+                    ),
+                ],
+                dependencies=[
+                    PlanVersionItemDependencyCreate(
+                        prerequisite_item_id=historical_ids[0],
+                        dependent_item_id=historical_ids[1],
+                    )
+                ],
+            ),
+            ActionContext(ActorType.ASSISTANT, evidence),
+        )
+        await session.commit()
+        revision_id = revision.id
+
+    async with factory() as verify:
+        approved = await verify.get(PlanVersion, approved_id)
+        previous = await verify.get(PlanVersion, current_id)
+        revision = await verify.get(PlanVersion, revision_id)
+        revised_items = list(
+            (
+                await verify.execute(
+                    select(PlanVersionItem)
+                    .where(PlanVersionItem.plan_version_id == revision_id)
+                    .order_by(PlanVersionItem.ordinal)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        dependency = (
+            await verify.execute(
+                select(PlanVersionItemDependency).where(
+                    PlanVersionItemDependency.plan_version_id == revision_id
+                )
+            )
+        ).scalar_one()
+        assert {item.id for item in revised_items}.isdisjoint(set(historical_ids))
+        assert (dependency.prerequisite_item_id, dependency.dependent_item_id) == (
+            revised_items[0].id,
+            revised_items[1].id,
+        )
+        assert approved.status == PlanVersionStatus.APPROVED
+        assert previous.status == PlanVersionStatus.SUPERSEDED
+        assert revision.status == PlanVersionStatus.CANDIDATE
+        (await ConsistencyVerifier(verify).verify()).require_ok()
+
+
+async def test_failed_postgres_revision_rolls_back_remap_items_events_and_status(
+    safety_engine, monkeypatch
+) -> None:
+    factory = async_sessionmaker(safety_engine, expire_on_commit=False)
+    plan_id, seeded = await seed_approved_with_current_candidate(factory)
+    approved_id, current_id, evidence_id, historical_ids = seeded
+    async with factory() as session:
+        before_versions = (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one()
+        before_items = (
+            await session.execute(select(func.count()).select_from(PlanVersionItem))
+        ).scalar_one()
+        before_events = (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one()
+        evidence = await session.get(Source, evidence_id)
+        service = PlanningService(session)
+        original = service._append_event
+
+        async def fail_after_items(**kwargs):
+            if kwargs["event_type"] == EventType.PLAN_VERSION_CREATED:
+                raise RuntimeError("synthetic revision failure after item persistence")
+            return await original(**kwargs)
+
+        monkeypatch.setattr(service, "_append_event", fail_after_items)
+        with pytest.raises(RuntimeError, match="after item persistence"):
+            await service.create_candidate_version(
+                PlanCandidateCreate(
+                    plan_id=plan_id,
+                    summary="Revision that must roll back",
+                    proposed_strategy_snapshot="Synthetic rollback",
+                    based_on_version_id=current_id,
+                    items=[
+                        PlanVersionItemCreate(
+                            id=historical_ids[0], ordinal=1, title="Replacement one"
+                        ),
+                        PlanVersionItemCreate(
+                            id=historical_ids[1], ordinal=2, title="Replacement two"
+                        ),
+                    ],
+                    dependencies=[
+                        PlanVersionItemDependencyCreate(
+                            prerequisite_item_id=historical_ids[0],
+                            dependent_item_id=historical_ids[1],
+                        )
+                    ],
+                ),
+                ActionContext(ActorType.ASSISTANT, evidence),
+            )
+        await session.commit()
+
+    async with factory() as verify:
+        approved = await verify.get(PlanVersion, approved_id)
+        current = await verify.get(PlanVersion, current_id)
+        assert approved.status == PlanVersionStatus.APPROVED
+        assert current.status == PlanVersionStatus.CANDIDATE
+        assert (
+            await verify.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one() == before_versions
+        assert (
+            await verify.execute(select(func.count()).select_from(PlanVersionItem))
+        ).scalar_one() == before_items
+        assert (
+            await verify.execute(select(func.count()).select_from(Event))
+        ).scalar_one() == before_events
+        (await ConsistencyVerifier(verify).verify()).require_ok()
 
 
 async def test_conflicting_approvals_leave_one_approved_and_matching_strategy(

@@ -40,7 +40,13 @@ class PlanCreate(BaseModel):
 
 
 class PlanVersionItemCreate(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
+    id: UUID = Field(
+        default_factory=uuid4,
+        description=(
+            "Temporary item handle for dependencies within this Candidate payload; "
+            "the server always assigns a new persisted item UUID"
+        ),
+    )
     ordinal: int = Field(gt=0)
     title: str = Field(max_length=500)
     description: str | None = None
@@ -133,6 +139,10 @@ class PlanCandidateReject(BaseModel):
 
 
 class PlanVersionApprove(BaseModel):
+    plan_version_id: UUID
+
+
+class HistoricalPlanVersionReactivate(BaseModel):
     plan_version_id: UUID
 
 

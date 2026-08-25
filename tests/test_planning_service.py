@@ -19,6 +19,8 @@ from elowyn.db.models import (
     Message,
     PlanItemProgress,
     PlanVersion,
+    PlanVersionItem,
+    PlanVersionItemDependency,
     Project,
     Source,
     SourceDependency,
@@ -115,6 +117,7 @@ async def source_with_message(
     conversation: Conversation | None = None,
     author: MessageAuthor = MessageAuthor.USER,
     offset_seconds: int = 0,
+    text: str | None = None,
 ) -> tuple[Source, Message, Conversation]:
     if conversation is None:
         conversation = Conversation(
@@ -126,7 +129,7 @@ async def source_with_message(
     message = Message(
         conversation_id=conversation.id,
         author=author,
-        text=f"synthetic {author.value}",
+        text=text or f"synthetic {author.value}",
         sent_at=datetime.now(UTC) + timedelta(seconds=offset_seconds),
     )
     session.add(message)
@@ -410,6 +413,263 @@ async def test_new_candidate_supersedes_only_candidate_and_allows_historical_bas
 
 
 @pytest.mark.asyncio
+async def test_revision_remaps_reused_item_handles_without_mutating_history(session) -> None:
+    evidence, conversation, goal, goal_event, plan = await seed_plan(session)
+    service = PlanningService(session)
+    approved = await service.create_candidate_version(
+        candidate_command(plan.entity_id, goal, goal_event),
+        ActionContext(ActorType.ASSISTANT, evidence),
+    )
+    _, approval = await present_and_approval_source(
+        session,
+        service,
+        approved,
+        await session.get(Source, approved.created_source_id),
+        conversation,
+    )
+    await service.approve_plan_version(
+        PlanVersionApprove(plan_version_id=approved.id),
+        ActionContext(ActorType.USER, approval),
+    )
+    task = await WorldStateService(session).create_task(
+        TaskCreate(title="Linked canonical task"),
+        ActionContext(ActorType.USER, evidence),
+    )
+    candidate = candidate_command(
+        plan.entity_id,
+        goal,
+        goal_event,
+        strategy="Three-week candidate",
+        based_on=approved.id,
+    )
+    candidate.items[0] = candidate.items[0].model_copy(
+        update={"linked_task_id": task.entity_id}
+    )
+    previous = await service.create_candidate_version(
+        candidate,
+        ActionContext(ActorType.ASSISTANT, evidence),
+    )
+    historical_items = list(
+        (
+            await session.execute(
+                select(PlanVersionItem)
+                .where(PlanVersionItem.plan_version_id == previous.id)
+                .order_by(PlanVersionItem.ordinal)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    historical_snapshot = [
+        (item.id, item.ordinal, item.title, item.linked_task_id) for item in historical_items
+    ]
+    revision = PlanCandidateCreate(
+        plan_id=plan.entity_id,
+        summary="Revised candidate",
+        proposed_strategy_snapshot="Three-week candidate, refined ending",
+        based_on_version_id=previous.id,
+        items=[
+            PlanVersionItemCreate(
+                id=historical_items[0].id,
+                ordinal=1,
+                title="Oral rehearsal",
+                linked_task_id=historical_items[0].linked_task_id,
+            ),
+            PlanVersionItemCreate(
+                id=historical_items[1].id,
+                ordinal=2,
+                title="Key ideas list",
+            ),
+        ],
+        dependencies=[
+            PlanVersionItemDependencyCreate(
+                prerequisite_item_id=historical_items[0].id,
+                dependent_item_id=historical_items[1].id,
+            )
+        ],
+    )
+
+    revised = await service.create_candidate_version(
+        revision,
+        ActionContext(ActorType.ASSISTANT, evidence),
+    )
+
+    revised_items = list(
+        (
+            await session.execute(
+                select(PlanVersionItem)
+                .where(PlanVersionItem.plan_version_id == revised.id)
+                .order_by(PlanVersionItem.ordinal)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    dependency = (
+        await session.execute(
+            select(PlanVersionItemDependency).where(
+                PlanVersionItemDependency.plan_version_id == revised.id
+            )
+        )
+    ).scalar_one()
+    assert {item.id for item in revised_items}.isdisjoint(
+        {item.id for item in historical_items}
+    )
+    assert (dependency.prerequisite_item_id, dependency.dependent_item_id) == (
+        revised_items[0].id,
+        revised_items[1].id,
+    )
+    assert revised_items[0].linked_task_id == task.entity_id
+    assert [
+        (item.id, item.ordinal, item.title, item.linked_task_id)
+        for item in (
+            (
+                await session.execute(
+                    select(PlanVersionItem)
+                    .where(PlanVersionItem.plan_version_id == previous.id)
+                    .order_by(PlanVersionItem.ordinal)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    ] == historical_snapshot
+    assert approved.status == PlanVersionStatus.APPROVED
+    assert previous.status == PlanVersionStatus.SUPERSEDED
+    assert revised.status == PlanVersionStatus.CANDIDATE
+
+
+@pytest.mark.asyncio
+async def test_change_explainability_separates_user_triggers_from_assistant_rationale(
+    session,
+) -> None:
+    evidence, conversation, goal, goal_event, plan = await seed_plan(session)
+    service = PlanningService(session)
+    query = PlanningQueryService(session)
+    initial = await service.create_candidate_version(
+        candidate_command(plan.entity_id, goal, goal_event),
+        ActionContext(ActorType.ASSISTANT, evidence),
+    )
+    _, initial_approval = await present_and_approval_source(
+        session,
+        service,
+        initial,
+        await session.get(Source, initial.created_source_id),
+        conversation,
+    )
+    await service.approve_plan_version(
+        PlanVersionApprove(plan_version_id=initial.id),
+        ActionContext(ActorType.USER, initial_approval),
+    )
+    duration_text = "Давай всё-таки читать не за две недели, а за три"
+    duration_source, duration_message, _ = await source_with_message(
+        session,
+        conversation=conversation,
+        offset_seconds=3,
+        text=duration_text,
+    )
+    duration = await service.create_candidate_version(
+        PlanCandidateCreate(
+            plan_id=plan.entity_id,
+            summary="Three-week plan",
+            rationale="A gentler pace may be more comfortable",
+            proposed_strategy_snapshot="Read over three weeks",
+            strategy_rationale_snapshot="More time can provide buffers",
+            based_on_version_id=initial.id,
+            items=[PlanVersionItemCreate(ordinal=1, title="Read")],
+        ),
+        ActionContext(ActorType.ASSISTANT, duration_source),
+    )
+    _, duration_approval = await present_and_approval_source(
+        session,
+        service,
+        duration,
+        await session.get(Source, duration.created_source_id),
+        conversation,
+    )
+    await service.approve_plan_version(
+        PlanVersionApprove(plan_version_id=duration.id),
+        ActionContext(ActorType.USER, duration_approval),
+    )
+    removal_text = "Убери письменное саммари"
+    removal_source, _, _ = await source_with_message(
+        session,
+        conversation=conversation,
+        offset_seconds=6,
+        text=removal_text,
+    )
+    removal = await service.create_candidate_version(
+        PlanCandidateCreate(
+            plan_id=plan.entity_id,
+            summary="Plan without written summary",
+            rationale="An oral ending may feel lighter",
+            proposed_strategy_snapshot="Read, then rehearse orally",
+            strategy_rationale_snapshot="Focus on recall",
+            based_on_version_id=duration.id,
+            items=[PlanVersionItemCreate(ordinal=1, title="Oral rehearsal")],
+        ),
+        ActionContext(ActorType.ASSISTANT, removal_source),
+    )
+    _, removal_approval = await present_and_approval_source(
+        session,
+        service,
+        removal,
+        await session.get(Source, removal.created_source_id),
+        conversation,
+    )
+    await service.approve_plan_version(
+        PlanVersionApprove(plan_version_id=removal.id),
+        ActionContext(ActorType.USER, removal_approval),
+    )
+
+    duration_reason = (await query.get_version_details(duration.id))["change_reason"]
+    removal_reason = (await query.get_version_details(removal.id))["change_reason"]
+    comparison = await query.compare_plan_versions(duration.id, removal.id)
+    assert duration_reason["user_trigger"] == {
+        "status": "RECORDED",
+        "evidence": [
+            {
+                "text": duration_text,
+                "occurred_at": duration_message.sent_at.isoformat(),
+                "author": "USER",
+            }
+        ],
+    }
+    assert removal_reason["user_trigger"]["evidence"][0]["text"] == removal_text
+    assert duration_reason["assistant_rationale"] == {
+        "plan": "A gentler pace may be more comfortable",
+        "strategy": "More time can provide buffers",
+        "classification": "ASSISTANT_RATIONALE_NOT_USER_MOTIVE",
+    }
+    assert comparison["newer_change_reason"] == removal_reason
+    assert "comfortable" not in str(duration_reason["user_trigger"])
+
+    system_source = Source(
+        source_type=SourceType.SYSTEM,
+        reason_summary="Synthetic version without recorded user trigger",
+    )
+    session.add(system_source)
+    await session.flush()
+    ungrounded = await service.create_candidate_version(
+        PlanCandidateCreate(
+            plan_id=plan.entity_id,
+            summary="No recorded reason",
+            rationale="This might hypothetically be useful",
+            proposed_strategy_snapshot="Unchanged synthetic approach",
+            based_on_version_id=removal.id,
+            items=[PlanVersionItemCreate(ordinal=1, title="Synthetic item")],
+        ),
+        ActionContext(ActorType.ASSISTANT, system_source),
+    )
+    ungrounded_reason = (await query.get_version_details(ungrounded.id))["change_reason"]
+    assert ungrounded_reason["user_trigger"] == {
+        "status": "NOT_RECORDED",
+        "evidence": [],
+    }
+    assert "hypothetically" not in str(ungrounded_reason["user_trigger"])
+
+
+@pytest.mark.asyncio
 async def test_plan_goal_validation_and_dependency_cycle(session) -> None:
     evidence, _, goal, goal_event, plan = await seed_plan(session)
     task = await WorldStateService(session).create_task(
@@ -529,10 +789,18 @@ async def test_presentation_is_idempotent_and_progress_never_mutates_linked_task
     version = await service.create_candidate_version(
         command, ActionContext(ActorType.ASSISTANT, evidence)
     )
+    persisted_item_id = (
+        await session.execute(
+            select(PlanVersionItem.id).where(
+                PlanVersionItem.plan_version_id == version.id,
+                PlanVersionItem.ordinal == 1,
+            )
+        )
+    ).scalar_one()
     with pytest.raises(DomainValidationError, match="Approved"):
         await service.update_plan_item_progress(
             PlanItemProgressUpdate(
-                plan_version_item_id=command.items[0].id,
+                plan_version_item_id=persisted_item_id,
                 status=PlanItemProgressStatus.IN_PROGRESS,
             ),
             ActionContext(ActorType.USER, evidence),
@@ -558,7 +826,7 @@ async def test_presentation_is_idempotent_and_progress_never_mutates_linked_task
     ).scalar_one()
     await service.update_plan_item_progress(
         PlanItemProgressUpdate(
-            plan_version_item_id=command.items[0].id,
+            plan_version_item_id=persisted_item_id,
             status=PlanItemProgressStatus.IN_PROGRESS,
         ),
         ActionContext(ActorType.USER, approval),
@@ -572,7 +840,7 @@ async def test_presentation_is_idempotent_and_progress_never_mutates_linked_task
     ).scalar_one()
     await service.update_plan_item_progress(
         PlanItemProgressUpdate(
-            plan_version_item_id=command.items[0].id,
+            plan_version_item_id=persisted_item_id,
             status=PlanItemProgressStatus.IN_PROGRESS,
         ),
         ActionContext(ActorType.USER, approval),
@@ -587,14 +855,14 @@ async def test_presentation_is_idempotent_and_progress_never_mutates_linked_task
     with pytest.raises(DomainValidationError, match="USER_MESSAGE"):
         await service.update_plan_item_progress(
             PlanItemProgressUpdate(
-                plan_version_item_id=command.items[0].id,
+                plan_version_item_id=persisted_item_id,
                 status=PlanItemProgressStatus.DONE,
             ),
             ActionContext(ActorType.ASSISTANT, inference),
         )
     assert (
         await PlanningQueryService(session).get_next_action(plan.entity_id)
-    ).id == command.items[0].id
+    ).id == persisted_item_id
     persisted_task = await session.get(Task, task.entity_id)
     assert persisted_task.title == "Canonical task"
     assert (

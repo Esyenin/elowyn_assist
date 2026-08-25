@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import elowyn.runtime as runtime_module
 from elowyn.assistant.context import BoundedMemoryContext
+from elowyn.assistant.planning_tools import has_explicit_replanning_intent
 from elowyn.db.base import Base
 from elowyn.db.models import (
     Event,
@@ -21,6 +23,7 @@ from elowyn.db.models import (
     PlanGoalLink,
     PlanItemProgress,
     PlanVersion,
+    PlanVersionBasis,
     PlanVersionItem,
     PlanVersionPresentation,
     Project,
@@ -29,6 +32,7 @@ from elowyn.db.models import (
     Task,
 )
 from elowyn.domain.enums import (
+    DeadlineType,
     EventType,
     MessageAuthor,
     PlanItemProgressStatus,
@@ -38,10 +42,38 @@ from elowyn.domain.enums import (
 )
 from elowyn.domain.messages import IncomingMessage
 from elowyn.runtime import ElowynRuntime
+from elowyn.services.planning_query import PlanningQueryService
 from elowyn.support.consistency import ConsistencyVerifier
 from elowyn.support.database_safety import assert_test_database_url
 
 pytestmark = pytest.mark.postgres
+
+
+@pytest.mark.parametrize(
+    "text_value",
+    [
+        "Убери письменное саммари. В последний день оставь только устную репетицию.",
+        "Давай всё-таки читать не за две недели, а за три.",
+        "Предложи обновлённый план на 5 дней.",
+        "Книгу надо закончить за 5 дней, перестрой план.",
+    ],
+)
+def test_explicit_replanning_intent_examples(text_value: str) -> None:
+    assert has_explicit_replanning_intent(text_value) is True
+
+
+@pytest.mark.parametrize(
+    "text_value",
+    [
+        "Книгу теперь надо закончить за 5 дней.",
+        "На самом деле книгу надо закончить уже через пять дней.",
+        "Наш текущий план всё ещё построен на актуальных данных?",
+        "Покажи текущий вариант.",
+        "Давай обсудим план, но пока ничего не меняй.",
+    ],
+)
+def test_basis_or_discussion_is_not_explicit_replanning_intent(text_value: str) -> None:
+    assert has_explicit_replanning_intent(text_value) is False
 
 
 @pytest.fixture
@@ -140,6 +172,13 @@ def one_tool_model(name: str, args: dict, response: str = "Готово.") -> Fu
     return FunctionModel(model_function)
 
 
+def model_must_not_run() -> FunctionModel:
+    def model_function(messages, info):
+        raise AssertionError("canonical Planning route must bypass model inference")
+
+    return FunctionModel(model_function)
+
+
 def inspected_tool_model(name: str, args: dict, response_builder) -> FunctionModel:
     def model_function(messages, info):
         returns = tool_returns(messages)
@@ -150,9 +189,71 @@ def inspected_tool_model(name: str, args: dict, response_builder) -> FunctionMod
     return FunctionModel(model_function)
 
 
-async def seed_approved(
-    factory, *, items: list[dict], dependencies=None, start_number: int = 1
-):
+def basis_update_then_candidate_model(
+    *,
+    goal_id: UUID,
+    plan_id: UUID,
+    based_on_version_id: UUID,
+    fail_after_candidate: bool = False,
+    create_new_plan: bool = False,
+) -> FunctionModel:
+    def model_function(messages, info):
+        returns = tool_returns(messages)
+        if not returns:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="update_goal",
+                        args={
+                            "entity_id": str(goal_id),
+                            "description": "Книгу надо закончить за пять дней",
+                        },
+                    )
+                ]
+            )
+        if len(returns) == 1:
+            candidate = {
+                "summary": "Пятидневный вариант",
+                "proposed_strategy_snapshot": "Сжать чтение до пяти дней",
+                "items": [{"ordinal": day, "title": f"Чтение: день {day}"} for day in range(1, 6)],
+            }
+            if create_new_plan:
+                tool_name = "create_plan_with_candidate"
+                args = {"plan": {"title": "Автоматический план"}, "candidate": candidate}
+            else:
+                tool_name = "present_candidate_plan"
+                args = {
+                    "plan_id": str(plan_id),
+                    "based_on_version_id": str(based_on_version_id),
+                    **candidate,
+                }
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=tool_name,
+                        args=args,
+                    )
+                ]
+            )
+        if fail_after_candidate:
+            raise RuntimeError("synthetic failure after replanning")
+        if returns[-1].get("result") == "candidate_not_created":
+            assert returns[-1]["reason"] == "replanning_intent_not_explicit"
+            return ModelResponse(
+                parts=[
+                    TextPart(
+                        "Текущий план теперь устарел относительно нового срока. "
+                        "Хочешь, я предложу обновлённый вариант на 5 дней?"
+                    )
+                ]
+            )
+        placeholder = returns[-1]["presentation_placeholder"]
+        return ModelResponse(parts=[TextPart(placeholder)])
+
+    return FunctionModel(model_function)
+
+
+async def seed_approved(factory, *, items: list[dict], dependencies=None, start_number: int = 1):
     await ElowynRuntime(
         session_factory=factory,
         model=candidate_model(items=items, dependencies=dependencies),
@@ -166,12 +267,49 @@ async def seed_approved(
         version = (await session.execute(select(PlanVersion))).scalar_one()
         persisted_items = list(
             (
-                await session.execute(
-                    select(PlanVersionItem).order_by(PlanVersionItem.ordinal)
-                )
+                await session.execute(select(PlanVersionItem).order_by(PlanVersionItem.ordinal))
             ).scalars()
         )
         return plan.entity_id, version.id, [item.id for item in persisted_items]
+
+
+async def seed_basis_approved(factory, *, start_number: int = 1):
+    await ElowynRuntime(
+        session_factory=factory,
+        model=one_tool_model("create_goal", {"title": "Прочитать книгу"}),
+    ).handle_message(incoming(start_number, "Создай цель прочитать книгу."))
+    async with factory() as session:
+        goal = (await session.execute(select(Goal))).scalar_one()
+        event = (
+            await session.execute(
+                select(Event).where(
+                    Event.entity_id == goal.entity_id,
+                    Event.event_type == EventType.GOAL_CREATED,
+                )
+            )
+        ).scalar_one()
+        goal_id, event_id = goal.entity_id, event.id
+    await ElowynRuntime(
+        session_factory=factory,
+        model=candidate_model(
+            items=[{"ordinal": day, "title": f"Чтение: день {day}"} for day in range(1, 15)],
+            basis=[
+                {
+                    "entity_id": str(goal_id),
+                    "event_id": str(event_id),
+                    "role": "GOAL",
+                }
+            ],
+        ),
+    ).handle_message(incoming(start_number + 1, "Предложи план чтения на 14 дней."))
+    await ElowynRuntime(
+        session_factory=factory,
+        model=one_tool_model("approve_presented_candidate", {}),
+    ).handle_message(incoming(start_number + 2, "Да."))
+    async with factory() as session:
+        plan = (await session.execute(select(Plan))).scalar_one()
+        version = (await session.execute(select(PlanVersion))).scalar_one()
+        return goal_id, plan.entity_id, version.id
 
 
 @pytest.mark.parametrize(
@@ -287,18 +425,15 @@ async def test_candidate_item_cannot_receive_progress_and_approved_item_wins(
     async with session_factory() as session:
         candidate = (
             await session.execute(
-                select(PlanVersion).where(
-                    PlanVersion.status == PlanVersionStatus.CANDIDATE
-                )
+                select(PlanVersion).where(PlanVersion.status == PlanVersionStatus.CANDIDATE)
             )
         ).scalar_one()
         candidate_item = (
             await session.execute(
-                select(PlanVersionItem).where(
-                    PlanVersionItem.plan_version_id == candidate.id
-                )
+                select(PlanVersionItem).where(PlanVersionItem.plan_version_id == candidate.id)
             )
         ).scalar_one()
+
     def approved_next_model(messages, info):
         returns = tool_returns(messages)
         if not returns:
@@ -566,9 +701,9 @@ async def test_combined_turn_rolls_back_progress_when_acknowledgement_save_fails
         assert first.status == PlanItemProgressStatus.NOT_STARTED
         user_count = (
             await session.execute(
-                select(func.count()).select_from(Message).where(
-                    Message.author == MessageAuthor.USER
-                )
+                select(func.count())
+                .select_from(Message)
+                .where(Message.author == MessageAuthor.USER)
             )
         ).scalar_one()
         assert user_count == 3
@@ -691,7 +826,9 @@ async def test_history_rejected_provenance_and_structured_compare(session_factor
     assert "старый шаг убран" in compare_response
 
 
-async def test_restore_historical_version_creates_new_candidate(session_factory) -> None:
+async def test_historical_approved_return_reactivates_identity_then_edit_creates_candidate(
+    session_factory,
+) -> None:
     plan_id, first_id, _ = await seed_approved(
         session_factory,
         items=[{"ordinal": 1, "title": "Исторический шаг"}],
@@ -710,76 +847,207 @@ async def test_restore_historical_version_creates_new_candidate(session_factory)
         session_factory=session_factory,
         model=one_tool_model("approve_presented_candidate", {}),
     ).handle_message(incoming(4, "Да."))
+    async with session_factory() as session:
+        versions = list(
+            (
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
+            ).scalars()
+        )
+        second_id = versions[1].id
+        first_item = (
+            await session.execute(
+                select(PlanVersionItem).where(PlanVersionItem.plan_version_id == first_id)
+            )
+        ).scalar_one()
+        first_progress = await session.get(PlanItemProgress, first_item.id)
+        first_snapshot = (first_item.id, first_item.title, first_progress.status)
 
-    def restore_model(messages, info):
-        returns = tool_returns(messages)
-        presentation = next(
-            (value for value in returns if "presentation_placeholder" in value),
-            None,
-        )
-        if presentation is not None:
-            return ModelResponse(parts=[TextPart(presentation["presentation_placeholder"])])
-        historical = next(
-            (value["version"] for value in returns if value.get("result") == "plan_version"),
-            None,
-        )
-        if historical is None:
+    def show_historical(messages, info):
+        if not has_tool_return(messages):
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="read_plan_version",
+                        tool_name="show_historical_plan_for_return",
                         args={"plan_version_id": str(first_id)},
                     )
                 ]
             )
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name="present_candidate_plan",
-                    args={
-                        "plan_id": str(plan_id),
-                        "summary": historical["summary"],
-                        "rationale": historical["rationale"],
-                        "proposed_strategy_snapshot": historical["proposed_strategy"],
-                        "strategy_rationale_snapshot": historical["strategy_rationale"],
-                        "based_on_version_id": str(first_id),
-                        "items": [
-                            {
-                                "ordinal": item["ordinal"],
-                                "title": item["title"],
-                                "description": item["description"],
-                                "expected_outcome": item["expected_outcome"],
-                                "deadline_at": item["deadline_at"],
-                                "estimated_duration_minutes": item[
-                                    "estimated_duration_minutes"
-                                ],
-                            }
-                            for item in historical["items"]
-                        ],
-                    },
-                )
-            ]
+        presentation = next(
+            value for value in tool_returns(messages) if "presentation_placeholder" in value
         )
+        assert presentation["result"] == "historical_approved_presented_for_confirmation"
+        return ModelResponse(parts=[TextPart(presentation["presentation_placeholder"])])
 
-    response = await ElowynRuntime(
+    shown = await ElowynRuntime(
         session_factory=session_factory,
-        model=FunctionModel(restore_model),
-    ).handle_message(incoming(5, "Давай вернёмся к предыдущему плану."))
-    assert "Исторический шаг" in response
+        model=FunctionModel(show_historical),
+    ).handle_message(incoming(5, "Покажи прежний утверждённый вариант."))
+    assert "Исторический шаг" in shown
+    async with session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one() == 2
+
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=one_tool_model("reactivate_presented_historical_plan", {}),
+    ).handle_message(incoming(6, "Вернёмся к нему."))
     async with session_factory() as session:
         versions = list(
             (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.version_number)
-                )
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
             ).scalars()
         )
         assert [version.status for version in versions] == [
-            PlanVersionStatus.SUPERSEDED,
             PlanVersionStatus.APPROVED,
+            PlanVersionStatus.SUPERSEDED,
+        ]
+        assert [version.id for version in versions] == [first_id, second_id]
+        first_item = (
+            await session.execute(
+                select(PlanVersionItem).where(PlanVersionItem.plan_version_id == first_id)
+            )
+        ).scalar_one()
+        first_progress = await session.get(PlanItemProgress, first_item.id)
+        assert (first_item.id, first_item.title, first_progress.status) == first_snapshot
+        strategy = (await session.execute(select(Strategy))).scalar_one()
+        assert strategy.accepted_from_plan_version_id == first_id
+        assert (await session.execute(select(func.count()).select_from(Task))).scalar_one() == 0
+        assert (await session.execute(select(func.count()).select_from(Project))).scalar_one() == 0
+        approval_events = list(
+            (
+                await session.execute(
+                    select(Event)
+                    .where(Event.event_type == EventType.PLAN_VERSION_APPROVED)
+                    .order_by(Event.created_at)
+                )
+            ).scalars()
+        )
+        activated_versions = [
+            next(change["new"] for change in event.changes if change["field"] == "version_id")
+            for event in approval_events
+        ]
+        assert activated_versions == [str(first_id), str(second_id), str(first_id)]
+
+    def inspect_activation_history(value):
+        assert [item["version_number"] for item in value["approval_activity"]] == [1, 2, 1]
+        assert [item["reactivated"] for item in value["approval_activity"]] == [
+            False,
+            False,
+            True,
+        ]
+        return "История активности: версия 1, версия 2, снова версия 1."
+
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=inspected_tool_model(
+            "read_plan_history",
+            {"plan_id": str(plan_id), "limit": 5},
+            inspect_activation_history,
+        ),
+    ).handle_message(incoming(7, "Покажи историю активности плана."))
+
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(
+            plan_id=plan_id,
+            based_on_version_id=first_id,
+            summary="Edited after return",
+            strategy="Historical approach with one edit",
+            items=[{"ordinal": 1, "title": "Исторический шаг уточнён"}],
+        ),
+    ).handle_message(incoming(8, "Теперь немного измени этот возвращённый план."))
+    async with session_factory() as session:
+        versions = list(
+            (
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
+            ).scalars()
+        )
+        assert [version.status for version in versions] == [
+            PlanVersionStatus.APPROVED,
+            PlanVersionStatus.SUPERSEDED,
             PlanVersionStatus.CANDIDATE,
         ]
-        assert versions[2].based_on_version_id == versions[0].id == first_id
+        assert versions[2].based_on_version_id == first_id
+
+
+async def test_historical_reactivation_failure_rolls_back_atomically(
+    session_factory, monkeypatch
+) -> None:
+    plan_id, first_id, _ = await seed_approved(
+        session_factory,
+        items=[{"ordinal": 1, "title": "Исторический шаг"}],
+    )
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(
+            plan_id=plan_id,
+            based_on_version_id=first_id,
+            summary="Current plan",
+            strategy="Current strategy",
+            items=[{"ordinal": 1, "title": "Текущий шаг"}],
+        ),
+    ).handle_message(incoming(3, "Предложи новый план."))
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=one_tool_model("approve_presented_candidate", {}),
+    ).handle_message(incoming(4, "Да."))
+
+    def show_historical(messages, info):
+        if not has_tool_return(messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="show_historical_plan_for_return",
+                        args={"plan_version_id": str(first_id)},
+                    )
+                ]
+            )
+        placeholder = next(
+            value["presentation_placeholder"]
+            for value in tool_returns(messages)
+            if "presentation_placeholder" in value
+        )
+        return ModelResponse(parts=[TextPart(placeholder)])
+
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=FunctionModel(show_historical),
+    ).handle_message(incoming(5, "Покажи старый план."))
+    async with session_factory() as session:
+        before_events = (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one()
+        current = (
+            await session.execute(
+                select(PlanVersion).where(PlanVersion.status == PlanVersionStatus.APPROVED)
+            )
+        ).scalar_one()
+        current_id = current.id
+
+    async def fail_strategy(self, **kwargs):
+        raise RuntimeError("synthetic reactivation Strategy failure")
+
+    monkeypatch.setattr(runtime_module.PlanningService, "_accept_strategy", fail_strategy)
+    with pytest.raises(RuntimeError, match="reactivation Strategy failure"):
+        await ElowynRuntime(
+            session_factory=session_factory,
+            model=one_tool_model("reactivate_presented_historical_plan", {}),
+        ).handle_message(incoming(6, "Вернёмся к нему."))
+    async with session_factory() as session:
+        historical = await session.get(PlanVersion, first_id)
+        current = await session.get(PlanVersion, current_id)
+        strategy = (await session.execute(select(Strategy))).scalar_one()
+        assert historical.status == PlanVersionStatus.SUPERSEDED
+        assert current.status == PlanVersionStatus.APPROVED
+        assert strategy.accepted_from_plan_version_id == current_id
+        assert (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one() == 2
+        assert (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one() == before_events
+        (await ConsistencyVerifier(session).verify()).require_ok()
 
 
 async def test_staleness_read_is_basis_scoped_and_never_replans(session_factory) -> None:
@@ -864,12 +1132,509 @@ async def test_staleness_read_is_basis_scoped_and_never_replans(session_factory)
             stale,
         ),
     ).handle_message(incoming(8, "План всё ещё актуален?"))
-    assert "не доказательство ошибки" in response
+    assert "Canonical Planning assessment" in response
+    assert "основание" in response
     async with session_factory() as session:
+        details = await PlanningQueryService(session).get_staleness_details(version_id)
+        assert details == {
+            "is_basis_stale": True,
+            "changed_basis": [{"role": "GOAL", "label": "Основание плана"}],
+        }
         version_count = (
             await session.execute(select(func.count()).select_from(PlanVersion))
         ).scalar_one()
         assert version_count == 1
+
+
+async def test_plain_basis_change_is_stale_without_candidate_until_explicit_replan(
+    session_factory,
+) -> None:
+    goal_id, plan_id, approved_id = await seed_basis_approved(session_factory)
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=basis_update_then_candidate_model(
+            goal_id=goal_id,
+            plan_id=plan_id,
+            based_on_version_id=approved_id,
+        ),
+    ).handle_message(incoming(4, "Книгу теперь надо закончить за 5 дней."))
+    assert "устарел" in response
+    assert "Хочешь" in response
+    async with session_factory() as session:
+        goal = await session.get(Goal, goal_id)
+        versions = list((await session.execute(select(PlanVersion))).scalars())
+        assert goal.target_date is not None
+        assert goal.target_date_type == DeadlineType.HARD
+        assert (
+            await session.execute(
+                select(func.count())
+                .select_from(Event)
+                .where(
+                    Event.entity_id == goal_id,
+                    Event.event_type == EventType.GOAL_UPDATED,
+                )
+            )
+        ).scalar_one() == 1
+        assert (
+            await session.execute(
+                select(func.count())
+                .select_from(PlanGoalLink)
+                .where(
+                    PlanGoalLink.plan_id == plan_id,
+                    PlanGoalLink.goal_id == goal_id,
+                )
+            )
+        ).scalar_one() == 1
+        assert [(version.id, version.status) for version in versions] == [
+            (approved_id, PlanVersionStatus.APPROVED)
+        ]
+
+    assessment = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(5, "Наш текущий план всё ещё построен на актуальных данных?"))
+    assert "Canonical Planning assessment" in assessment
+    assert "основание" in assessment
+    async with session_factory() as session:
+        stale = await PlanningQueryService(session).assess_plan_staleness(approved_id)
+        assert stale.is_stale is True
+        assert [changed.entity_id for changed in stale.changed_basis] == [goal_id]
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(
+            plan_id=plan_id,
+            based_on_version_id=approved_id,
+            summary="Пятидневный вариант",
+            items=[{"ordinal": day, "title": f"Чтение: день {day}"} for day in range(1, 6)],
+        ),
+    ).handle_message(incoming(6, "Предложи обновлённый план на 5 дней."))
+    async with session_factory() as session:
+        versions = list(
+            (
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
+            ).scalars()
+        )
+        assert [version.status for version in versions] == [
+            PlanVersionStatus.APPROVED,
+            PlanVersionStatus.CANDIDATE,
+        ]
+        assert versions[0].id == approved_id
+        assert (
+            await PlanningQueryService(session).assess_plan_staleness(approved_id)
+        ).is_stale is True
+        candidate_basis = list(
+            (
+                await session.execute(
+                    select(PlanVersionBasis).where(
+                        PlanVersionBasis.plan_version_id == versions[1].id
+                    )
+                )
+            ).scalars()
+        )
+        assert [(basis.entity_id, basis.role.value) for basis in candidate_basis] == [
+            (goal_id, "GOAL")
+        ]
+
+
+async def test_deadline_basis_change_persists_for_legacy_approved_without_basis(
+    session_factory,
+) -> None:
+    plan_id, approved_id, _ = await seed_approved(
+        session_factory,
+        items=[{"ordinal": day, "title": f"Чтение: день {day}"} for day in range(1, 15)],
+    )
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(3, "Уточняю: книгу нужно закончить через пять дней."))
+    assert "canonical основание" in response
+    assert "устарел" in response
+    async with session_factory() as session:
+        versions = list((await session.execute(select(PlanVersion))).scalars())
+        goal = (await session.execute(select(Goal))).scalar_one()
+        link = (await session.execute(select(PlanGoalLink))).scalar_one()
+        event_types = set((await session.execute(select(Event.event_type))).scalars())
+        assert [(version.id, version.status) for version in versions] == [
+            (approved_id, PlanVersionStatus.APPROVED)
+        ]
+        assert goal.target_date is not None
+        assert goal.target_date_type == DeadlineType.HARD
+        assert link.plan_id == plan_id
+        assert link.goal_id == goal.entity_id
+        assert EventType.GOAL_CREATED in event_types
+        assert EventType.PLAN_GOAL_LINKED in event_types
+        assessment = await PlanningQueryService(session).assess_plan_staleness(approved_id)
+        assert assessment.is_stale is True
+        assert [changed.entity_id for changed in assessment.changed_basis] == [goal.entity_id]
+    after_restart = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(4, "Наш текущий план всё ещё построен на актуальных данных?"))
+    assert "Canonical Planning assessment" in after_restart
+    assert "основание" in after_restart
+
+
+async def test_same_message_basis_change_and_explicit_replan_creates_candidate(
+    session_factory,
+) -> None:
+    goal_id, plan_id, approved_id = await seed_basis_approved(session_factory)
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=basis_update_then_candidate_model(
+            goal_id=goal_id,
+            plan_id=plan_id,
+            based_on_version_id=approved_id,
+        ),
+    ).handle_message(incoming(4, "Книгу надо закончить за 5 дней, перестрой план."))
+    assert "Чтение: день 5" in response
+    async with session_factory() as session:
+        versions = list(
+            (
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
+            ).scalars()
+        )
+        assert [version.status for version in versions] == [
+            PlanVersionStatus.APPROVED,
+            PlanVersionStatus.CANDIDATE,
+        ]
+
+
+async def test_planning_history_and_current_candidate_do_not_grant_replanning_intent(
+    session_factory,
+) -> None:
+    goal_id, plan_id, approved_id = await seed_basis_approved(session_factory)
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(
+            plan_id=plan_id,
+            based_on_version_id=approved_id,
+            summary="Недавний вариант",
+            items=[{"ordinal": 1, "title": "Недавний шаг"}],
+        ),
+    ).handle_message(incoming(4, "Предложи другой вариант плана."))
+    async with session_factory() as session:
+        current_candidate = (
+            await session.execute(
+                select(PlanVersion).where(PlanVersion.status == PlanVersionStatus.CANDIDATE)
+            )
+        ).scalar_one()
+        candidate_id = current_candidate.id
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=basis_update_then_candidate_model(
+            goal_id=goal_id,
+            plan_id=plan_id,
+            based_on_version_id=candidate_id,
+            create_new_plan=True,
+        ),
+    ).handle_message(incoming(5, "На самом деле книгу надо закончить уже через пять дней."))
+    assert "Хочешь" in response
+    async with session_factory() as session:
+        versions = list((await session.execute(select(PlanVersion))).scalars())
+        assert (await session.execute(select(func.count()).select_from(Plan))).scalar_one() == 1
+        assert len(versions) == 2
+        assert next(v for v in versions if v.id == approved_id).status == PlanVersionStatus.APPROVED
+        assert (
+            next(v for v in versions if v.id == candidate_id).status == PlanVersionStatus.CANDIDATE
+        )
+
+
+async def test_explicit_basis_update_and_replan_failure_rolls_back_atomically(
+    session_factory,
+) -> None:
+    goal_id, plan_id, approved_id = await seed_basis_approved(session_factory)
+    async with session_factory() as session:
+        before_events = (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one()
+    with pytest.raises(RuntimeError, match="failure after replanning"):
+        await ElowynRuntime(
+            session_factory=session_factory,
+            model=basis_update_then_candidate_model(
+                goal_id=goal_id,
+                plan_id=plan_id,
+                based_on_version_id=approved_id,
+                fail_after_candidate=True,
+            ),
+        ).handle_message(incoming(4, "Книгу надо закончить за 5 дней, перестрой план."))
+    async with session_factory() as session:
+        goal = await session.get(Goal, goal_id)
+        versions = list((await session.execute(select(PlanVersion))).scalars())
+        assert goal.description is None
+        assert [(version.id, version.status) for version in versions] == [
+            (approved_id, PlanVersionStatus.APPROVED)
+        ]
+        assert (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one() == before_events
+        (await ConsistencyVerifier(session).verify()).require_ok()
+
+
+@pytest.mark.asyncio
+async def test_same_plan_shorter_is_compact_presentation_without_new_version(
+    session_factory,
+) -> None:
+    runtime = ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(
+            summary="План чтения на 21 день",
+            strategy="Читать небольшими блоками каждый день",
+            rationale="Подробное обоснование, которое не нужно повторять в compact view",
+            items=[
+                {
+                    "ordinal": 1,
+                    "title": "Дни 1–7: первая часть",
+                    "description": "Очень подробное описание первого этапа",
+                },
+                {"ordinal": 2, "title": "Дни 8–21: завершение"},
+            ],
+        ),
+    )
+    await runtime.handle_message(incoming(1, "Предложи план чтения на 21 день."))
+    async with session_factory() as session:
+        before_versions = (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one()
+        before_presentations = (
+            await session.execute(select(func.count()).select_from(PlanVersionPresentation))
+        ).scalar_one()
+        candidate = (await session.execute(select(PlanVersion))).scalar_one()
+
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(2, "Можешь этот же план написать короче? Очень длинно получилось"))
+
+    assert response is not None
+    assert "Пункты (2):" in response
+    assert "Дни 1–7: первая часть" in response
+    assert "Дни 8–21: завершение" in response
+    assert "Очень подробное описание" not in response
+    assert "Подробное обоснование" not in response
+    async with session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one() == before_versions
+        assert (
+            await session.execute(select(func.count()).select_from(PlanVersionPresentation))
+        ).scalar_one() == before_presentations + 1
+        unchanged = await session.get(PlanVersion, candidate.id)
+        assert unchanged is not None
+        assert unchanged.status == PlanVersionStatus.CANDIDATE
+
+
+@pytest.mark.asyncio
+async def test_work_on_first_item_together_does_not_approve_or_mutate_progress(
+    session_factory,
+) -> None:
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(
+            items=[
+                {
+                    "ordinal": 1,
+                    "title": "Сформулировать ключевую идею",
+                    "description": "Запиши идею одним предложением.",
+                }
+            ]
+        ),
+    ).handle_message(incoming(1, "Предложи рабочий план."))
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=one_tool_model("approve_presented_candidate", {}, "План утверждён."),
+    ).handle_message(incoming(2, "Да."))
+    async with session_factory() as session:
+        version = (await session.execute(select(PlanVersion))).scalar_one()
+        progress = (await session.execute(select(PlanItemProgress))).scalar_one()
+        progress_id = progress.plan_version_item_id
+        progress_status = progress.status
+
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(3, "Сделай пока первый пункт вместе со мной"))
+
+    assert response is not None
+    assert response.startswith("Давай начнём вместе.")
+    assert "Запиши идею одним предложением." in response
+    async with session_factory() as session:
+        unchanged_version = await session.get(PlanVersion, version.id)
+        unchanged_progress = await session.get(PlanItemProgress, progress_id)
+        assert unchanged_version is not None
+        assert unchanged_version.status == PlanVersionStatus.APPROVED
+        assert unchanged_progress is not None
+        assert unchanged_progress.status == progress_status == PlanItemProgressStatus.NOT_STARTED
+        assert (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_context_canonically_records_rejected_candidate_history(
+    session_factory,
+) -> None:
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=candidate_model(items=[{"ordinal": 1, "title": "Первый пункт"}]),
+    ).handle_message(incoming(1, "Предложи план."))
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(2, "Отмени текущий предложенный вариант."))
+
+    async with session_factory() as session:
+        payload = json.loads(await PlanningQueryService(session).render_for_agent())
+        plan = payload["plans"][0]
+        assert plan["current_candidate"] is None
+        assert plan["recent_version_history"] == [
+            {"version_number": 1, "status": "REJECTED"}
+        ]
+        assert plan["title_semantics"] == "LINEAGE_LABEL_NOT_VERSION_DURATION"
+
+
+@pytest.mark.asyncio
+async def test_collaborative_next_action_skips_done_item_without_progress_mutation(
+    session_factory,
+) -> None:
+    plan_id, version_id, item_ids = await seed_approved(
+        session_factory,
+        items=[
+            {"ordinal": 1, "title": "День 1", "description": "Уже завершён."},
+            {
+                "ordinal": 2,
+                "title": "Дни 2–8",
+                "description": "Разберём следующий блок чтения.",
+            },
+        ],
+    )
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=one_tool_model(
+            "update_approved_plan_progress",
+            {"plan_id": str(plan_id), "ordinal": 1, "status": "DONE"},
+        ),
+    ).handle_message(incoming(3, "Первый пункт выполнен."))
+    async with session_factory() as session:
+        before = {
+            item_id: (await session.get(PlanItemProgress, item_id)).status
+            for item_id in item_ids
+        }
+
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(4, "Сделай следующий пункт вместе со мной."))
+
+    assert response is not None
+    assert "Пункт 2 — «Дни 2–8»" in response
+    assert "День 1" not in response
+    assert "Разберём следующий блок чтения." in response
+    async with session_factory() as session:
+        version = await session.get(PlanVersion, version_id)
+        after = {
+            item_id: (await session.get(PlanItemProgress, item_id)).status
+            for item_id in item_ids
+        }
+        assert version is not None
+        assert version.status == PlanVersionStatus.APPROVED
+        assert after == before == {
+            item_ids[0]: PlanItemProgressStatus.DONE,
+            item_ids[1]: PlanItemProgressStatus.NOT_STARTED,
+        }
+
+
+@pytest.mark.asyncio
+async def test_exact_rejected_history_question_reads_v7_not_current_candidate(
+    session_factory,
+) -> None:
+    plan_id, approved_id, _ = await seed_approved(
+        session_factory,
+        items=[{"ordinal": 1, "title": "Утверждённый пункт"}],
+    )
+    based_on = approved_id
+    for number in range(2, 8):
+        await ElowynRuntime(
+            session_factory=session_factory,
+            model=candidate_model(
+                plan_id=plan_id,
+                based_on_version_id=based_on,
+                summary=("Вариант на 5 дней" if number == 7 else f"Вариант {number}"),
+                items=[{"ordinal": 1, "title": f"Пункт версии {number}"}],
+            ),
+        ).handle_message(incoming(number + 1, f"Предложи вариант {number}."))
+        async with session_factory() as session:
+            current = (
+                await session.execute(
+                    select(PlanVersion).where(
+                        PlanVersion.status == PlanVersionStatus.CANDIDATE
+                    )
+                )
+            ).scalar_one()
+            based_on = current.id
+    await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(9, "Отмени текущий предложенный вариант."))
+    async with session_factory() as session:
+        before_events = (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one()
+
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(
+        incoming(10, "Что стало с предыдущим отклонённым вариантом на 5 дней?")
+    )
+
+    assert response is not None
+    assert "Версия v7 существовала и была отклонена" in response
+    assert "нет текущего предложенного варианта для отклонения" not in response
+    async with session_factory() as session:
+        versions = list((await session.execute(select(PlanVersion))).scalars())
+        assert len(versions) == 7
+        assert next(version for version in versions if version.version_number == 7).status == (
+            PlanVersionStatus.REJECTED
+        )
+        assert not any(version.status == PlanVersionStatus.CANDIDATE for version in versions)
+        assert (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one() == before_events
+
+
+@pytest.mark.asyncio
+async def test_presence_small_talk_bypasses_planning_and_model_output(
+    session_factory,
+) -> None:
+    _, version_id, item_ids = await seed_approved(
+        session_factory,
+        items=[{"ordinal": 1, "title": "Не упоминать этот пункт"}],
+    )
+    async with session_factory() as session:
+        before_status = (await session.get(PlanItemProgress, item_ids[0])).status
+        before_events = (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one()
+
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+        memory_service=object(),
+    ).handle_message(incoming(3, "Ты тут?"))
+
+    assert response == "Да, я здесь."
+    assert "план" not in response.casefold()
+    assert "stale" not in response.casefold()
+    async with session_factory() as session:
+        version = await session.get(PlanVersion, version_id)
+        progress = await session.get(PlanItemProgress, item_ids[0])
+        assert version is not None
+        assert version.status == PlanVersionStatus.APPROVED
+        assert progress is not None
+        assert progress.status == before_status
+        assert (
+            await session.execute(select(func.count()).select_from(Event))
+        ).scalar_one() == before_events
 
 
 async def test_normal_planning_context_excludes_twenty_historical_versions(
@@ -895,9 +1660,7 @@ async def test_normal_planning_context_excludes_twenty_historical_versions(
         async with session_factory() as session:
             current = (
                 await session.execute(
-                    select(PlanVersion).where(
-                        PlanVersion.status == PlanVersionStatus.CANDIDATE
-                    )
+                    select(PlanVersion).where(PlanVersion.status == PlanVersionStatus.CANDIDATE)
                 )
             ).scalar_one()
             based_on = current.id
@@ -939,9 +1702,7 @@ async def test_normal_planning_context_excludes_twenty_historical_versions(
     ).handle_message(incoming(24, "Покажи историю версий."))
 
 
-async def test_v03_deterministic_runtime_acceptance_cycle(
-    session_factory, monkeypatch
-) -> None:
+async def test_v03_deterministic_runtime_acceptance_cycle(session_factory, monkeypatch) -> None:
     """Exercise the complete v0.3 user cycle through durable runtime boundaries."""
 
     await ElowynRuntime(
@@ -1085,9 +1846,7 @@ async def test_v03_deterministic_runtime_acceptance_cycle(
     async with session_factory() as session:
         versions = list(
             (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.version_number)
-                )
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
             ).scalars()
         )
         assert [version.status for version in versions] == [
@@ -1167,6 +1926,17 @@ async def test_v03_deterministic_runtime_acceptance_cycle(
         versions = value["versions"]
         assert [version["status"] for version in versions] == ["APPROVED", "SUPERSEDED"]
         assert versions[0]["creation_evidence"][0]["text"] == correction_text
+        assert versions[0]["change_reason"]["user_trigger"]["evidence"][0]["text"] == (
+            correction_text
+        )
+        assert (
+            versions[0]["change_reason"]["assistant_rationale"]["classification"]
+            == "ASSISTANT_RATIONALE_NOT_USER_MOTIVE"
+        )
+        contract = value["explainability_answer_contract"]
+        assert "user_trigger evidence first" in contract
+        assert "never as the user's motive" in contract
+        assert "do not infer one" in contract
         return "Мы изменили вариант после твоего отказа от третьего пункта."
 
     reason_response = await ElowynRuntime(
@@ -1220,7 +1990,14 @@ async def test_v03_deterministic_runtime_acceptance_cycle(
             explain_staleness,
         ),
     ).handle_message(incoming(9, "Наш план всё ещё актуален?"))
-    assert "не означает" in stale_response
+    assert "Canonical Planning assessment" in stale_response
+    assert "основание" in stale_response
+    async with session_factory() as session:
+        details = await PlanningQueryService(session).get_staleness_details(second_id)
+        assert details == {
+            "is_basis_stale": True,
+            "changed_basis": [{"role": "GOAL", "label": "Найти новую работу"}],
+        }
 
     def after_restart(value):
         snapshot = value["plan"]

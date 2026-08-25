@@ -173,6 +173,47 @@ def decision_model(
     return FunctionModel(model_function)
 
 
+def model_must_not_run() -> FunctionModel:
+    def model_function(messages, info):
+        raise AssertionError("canonical reject routing must bypass the model")
+
+    return FunctionModel(model_function)
+
+
+async def seed_approved_and_hidden_current_candidate(factory):
+    await ElowynRuntime(
+        session_factory=factory,
+        model=concrete_model(),
+    ).handle_message(incoming(1, "Предложи конкретный план."))
+    await ElowynRuntime(
+        session_factory=factory,
+        model=decision_model("approve_presented_candidate"),
+    ).handle_message(incoming(2, "Да."))
+    async with factory() as session:
+        plan = (await session.execute(select(Plan))).scalar_one()
+        approved = (await session.execute(select(PlanVersion))).scalar_one()
+        plan_id, approved_id = plan.entity_id, approved.id
+    await ElowynRuntime(
+        session_factory=factory,
+        model=revision_model(plan_id, approved_id),
+    ).handle_message(incoming(3, "Предложи новый вариант."))
+    await ElowynRuntime(
+        session_factory=factory,
+        model=FunctionModel(
+            lambda messages, info: ModelResponse(
+                parts=[TextPart("Обсуждение продолжено без изменения Planning state.")]
+            )
+        ),
+    ).handle_message(incoming(4, "Пока просто продолжим обсуждение."))
+    async with factory() as session:
+        candidate = (
+            await session.execute(
+                select(PlanVersion).where(PlanVersion.status == PlanVersionStatus.CANDIDATE)
+            )
+        ).scalar_one()
+        return approved_id, candidate.id
+
+
 def two_candidates_model() -> FunctionModel:
     def model_function(messages, info):
         placeholders = returned_placeholders(messages)
@@ -220,16 +261,16 @@ async def counts(factory) -> dict[str, int]:
             ).scalar_one(),
             "assistant": (
                 await session.execute(
-                    select(func.count()).select_from(Message).where(
-                        Message.author == MessageAuthor.ASSISTANT
-                    )
+                    select(func.count())
+                    .select_from(Message)
+                    .where(Message.author == MessageAuthor.ASSISTANT)
                 )
             ).scalar_one(),
             "user": (
                 await session.execute(
-                    select(func.count()).select_from(Message).where(
-                        Message.author == MessageAuthor.USER
-                    )
+                    select(func.count())
+                    .select_from(Message)
+                    .where(Message.author == MessageAuthor.USER)
                 )
             ).scalar_one(),
             "tasks": (await session.execute(select(func.count()).select_from(Task))).scalar_one(),
@@ -356,9 +397,9 @@ async def test_ambiguous_yes_and_no_presentation_do_not_approve(session_factory)
     async with session_factory() as session:
         assert (
             await session.execute(
-                select(func.count()).select_from(PlanVersion).where(
-                    PlanVersion.status == PlanVersionStatus.APPROVED
-                )
+                select(func.count())
+                .select_from(PlanVersion)
+                .where(PlanVersion.status == PlanVersionStatus.APPROVED)
             )
         ).scalar_one() == 0
 
@@ -372,11 +413,7 @@ async def test_explicit_reference_can_select_one_of_two_presented_candidates(
     ).handle_message(incoming(1, "Покажи два цельных варианта."))
     async with session_factory() as session:
         versions = list(
-            (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.summary)
-                )
-            ).scalars()
+            (await session.execute(select(PlanVersion).order_by(PlanVersion.summary))).scalars()
         )
         selected_id = versions[1].id
     await ElowynRuntime(
@@ -390,9 +427,7 @@ async def test_explicit_reference_can_select_one_of_two_presented_candidates(
         selected = await session.get(PlanVersion, selected_id)
         others = list(
             (
-                await session.execute(
-                    select(PlanVersion).where(PlanVersion.id != selected_id)
-                )
+                await session.execute(select(PlanVersion).where(PlanVersion.id != selected_id))
             ).scalars()
         )
         assert selected is not None and selected.status == PlanVersionStatus.APPROVED
@@ -478,12 +513,113 @@ async def test_explicit_reject_rejects_candidate_without_strategy(session_factor
         assert (await session.execute(select(func.count()).select_from(Strategy))).scalar_one() == 0
 
 
+@pytest.mark.parametrize(
+    "reject_text",
+    [
+        "Отмени текущий предложенный вариант.",
+        "Я не хочу его утверждать.",
+        "Этот вариант не подходит.",
+        "Отклоняю кандидат.",
+    ],
+)
+async def test_explicit_current_candidate_reject_uses_canonical_state_after_restart(
+    session_factory,
+    reject_text: str,
+) -> None:
+    approved_id, candidate_id = await seed_approved_and_hidden_current_candidate(session_factory)
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(5, reject_text))
+    assert "предложенный вариант отклонён" in response
+    assert "утверждённый план не изменён" in response
+    async with session_factory() as session:
+        approved = await session.get(PlanVersion, approved_id)
+        candidate = await session.get(PlanVersion, candidate_id)
+        rejected_events = (
+            await session.execute(
+                select(func.count())
+                .select_from(Event)
+                .where(
+                    Event.event_type == EventType.PLAN_VERSION_REJECTED,
+                    Event.entity_id == candidate.plan_id,
+                )
+            )
+        ).scalar_one()
+        current_candidate_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(PlanVersion)
+                .where(PlanVersion.status == PlanVersionStatus.CANDIDATE)
+            )
+        ).scalar_one()
+        assert approved.status == PlanVersionStatus.APPROVED
+        assert candidate.status == PlanVersionStatus.REJECTED
+        assert rejected_events == 1
+        assert current_candidate_count == 0
+
+
+async def test_explicit_current_candidate_reject_without_candidate_is_canonical_noop(
+    session_factory,
+) -> None:
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(1, "Отмени текущий предложенный вариант."))
+    assert response == "Сейчас нет текущего предложенного варианта для отклонения."
+    async with session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(PlanVersion))
+        ).scalar_one() == 0
+        assert (await session.execute(select(func.count()).select_from(Event))).scalar_one() == 0
+
+
+@pytest.mark.parametrize("ambiguous_text", ["Отмени это.", "Не утверждай это."])
+async def test_ambiguous_candidate_cancel_clarifies_without_mutation(
+    session_factory,
+    ambiguous_text: str,
+) -> None:
+    approved_id, candidate_id = await seed_approved_and_hidden_current_candidate(session_factory)
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=model_must_not_run(),
+    ).handle_message(incoming(5, ambiguous_text))
+    assert "отклонить" in response
+    assert "только пока не утверждать" in response
+    async with session_factory() as session:
+        assert (await session.get(PlanVersion, approved_id)).status == PlanVersionStatus.APPROVED
+        assert (await session.get(PlanVersion, candidate_id)).status == PlanVersionStatus.CANDIDATE
+        assert (
+            await session.execute(
+                select(func.count())
+                .select_from(Event)
+                .where(Event.event_type == EventType.PLAN_VERSION_REJECTED)
+            )
+        ).scalar_one() == 0
+
+
+async def test_keep_current_plan_language_does_not_reject_candidate(session_factory) -> None:
+    approved_id, candidate_id = await seed_approved_and_hidden_current_candidate(session_factory)
+    response = await ElowynRuntime(
+        session_factory=session_factory,
+        model=FunctionModel(
+            lambda messages, info: ModelResponse(
+                parts=[TextPart("Оставляю Planning state без изменений.")]
+            )
+        ),
+    ).handle_message(incoming(5, "Оставь пока текущий план."))
+    assert "без изменений" in response
+    async with session_factory() as session:
+        assert (await session.get(PlanVersion, approved_id)).status == PlanVersionStatus.APPROVED
+        assert (await session.get(PlanVersion, candidate_id)).status == PlanVersionStatus.CANDIDATE
+
+
 async def test_concrete_revision_and_show_again_bind_exact_presentations(session_factory) -> None:
     first_response = await ElowynRuntime(
         session_factory=session_factory,
         model=concrete_model(),
     ).handle_message(incoming(1, "Предложи конкретный план."))
-    assert "Стратегия:\nСначала проверить рынок" in first_response
+    assert "Сохранённая стратегия этой версии:\nСначала проверить рынок" in first_response
     assert "1. Обновить резюме" in first_response
     assert "ELOWYN_PLAN_PRESENTATION" not in first_response
     assert await counts(session_factory) == {
@@ -612,9 +748,9 @@ async def test_failed_revision_restores_previous_current_candidate(session_facto
         assert versions[0].status == PlanVersionStatus.CANDIDATE
         assert (
             await session.execute(
-                select(func.count()).select_from(Message).where(
-                    Message.author == MessageAuthor.USER
-                )
+                select(func.count())
+                .select_from(Message)
+                .where(Message.author == MessageAuthor.USER)
             )
         ).scalar_one() == 2
 
@@ -647,9 +783,7 @@ async def test_new_candidate_approval_supersedes_old_approved_and_replaces_strat
     async with session_factory() as session:
         versions = list(
             (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.version_number)
-                )
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
             ).scalars()
         )
         strategy = (await session.execute(select(Strategy))).scalar_one()
@@ -689,9 +823,7 @@ async def test_reject_new_candidate_keeps_old_approved_and_strategy(session_fact
     async with session_factory() as session:
         versions = list(
             (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.version_number)
-                )
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
             ).scalars()
         )
         strategy = (await session.execute(select(Strategy))).scalar_one()
@@ -727,9 +859,7 @@ async def test_stale_explicit_target_is_not_substituted_with_new_candidate(sessi
     async with session_factory() as session:
         versions = list(
             (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.version_number)
-                )
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
             ).scalars()
         )
         assert [version.status for version in versions] == [
@@ -755,9 +885,9 @@ async def test_reprocessing_same_approval_message_is_idempotent(session_factory)
         version = (await session.execute(select(PlanVersion))).scalar_one()
         approval_events = (
             await session.execute(
-                select(func.count()).select_from(Event).where(
-                    Event.event_type == EventType.PLAN_VERSION_APPROVED
-                )
+                select(func.count())
+                .select_from(Event)
+                .where(Event.event_type == EventType.PLAN_VERSION_APPROVED)
             )
         ).scalar_one()
         assert version.status == PlanVersionStatus.APPROVED
@@ -796,9 +926,9 @@ async def test_approval_acknowledgement_failure_rolls_back_approval(
         assert (await session.execute(select(func.count()).select_from(Strategy))).scalar_one() == 0
         user_count = (
             await session.execute(
-                select(func.count()).select_from(Message).where(
-                    Message.author == MessageAuthor.USER
-                )
+                select(func.count())
+                .select_from(Message)
+                .where(Message.author == MessageAuthor.USER)
             )
         ).scalar_one()
         assert user_count == 2
@@ -836,9 +966,7 @@ async def test_strategy_acceptance_failure_restores_old_approved(
     async with session_factory() as session:
         versions = list(
             (
-                await session.execute(
-                    select(PlanVersion).order_by(PlanVersion.version_number)
-                )
+                await session.execute(select(PlanVersion).order_by(PlanVersion.version_number))
             ).scalars()
         )
         strategy = (await session.execute(select(Strategy))).scalar_one()

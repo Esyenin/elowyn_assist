@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -27,6 +28,7 @@ from elowyn.db.models import (
 )
 from elowyn.domain.enums import (
     EventType,
+    MessageAuthor,
     PlanItemProgressStatus,
     PlanVersionBasisRole,
     PlanVersionStatus,
@@ -38,7 +40,7 @@ from elowyn.domain.errors import DomainValidationError, EntityNotFoundError
 @dataclass(frozen=True)
 class ChangedPlanBasis:
     entity_id: uuid.UUID
-    recorded_event_id: uuid.UUID
+    recorded_event_id: uuid.UUID | None
     latest_event_id: uuid.UUID
 
 
@@ -55,9 +57,7 @@ class PlanningQueryService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def render_for_agent(
-        self, *, max_plans: int = 8, max_items_per_version: int = 20
-    ) -> str:
+    async def render_for_agent(self, *, max_plans: int = 8, max_items_per_version: int = 20) -> str:
         """Render only current bounded Planning state needed for Candidate routing."""
 
         if not 1 <= max_plans <= 20 or not 1 <= max_items_per_version <= 50:
@@ -135,10 +135,19 @@ class PlanningQueryService:
                 .scalars()
                 .all()
             )
+            recent_history = await self.get_plan_history(plan.entity_id, limit=8)
             payload.append(
                 {
                     "internal_plan_id": str(plan.entity_id),
                     "title": plan.title,
+                    "title_semantics": "LINEAGE_LABEL_NOT_VERSION_DURATION",
+                    "recent_version_history": [
+                        {
+                            "version_number": version.version_number,
+                            "status": version.status.value,
+                        }
+                        for version in recent_history
+                    ],
                     "goal_links": [
                         {"internal_goal_id": str(link.goal_id), "role": link.role.value}
                         for link in goal_links
@@ -174,9 +183,7 @@ class PlanningQueryService:
             raise EntityNotFoundError(f"PlanVersion {version_id} was not found")
         return version
 
-    async def _current(
-        self, plan_id: uuid.UUID, status: PlanVersionStatus
-    ) -> PlanVersion | None:
+    async def _current(self, plan_id: uuid.UUID, status: PlanVersionStatus) -> PlanVersion | None:
         await self.get_plan(plan_id)
         return (
             await self.session.execute(
@@ -193,9 +200,31 @@ class PlanningQueryService:
     async def get_current_approved(self, plan_id: uuid.UUID) -> PlanVersion | None:
         return await self._current(plan_id, PlanVersionStatus.APPROVED)
 
-    async def get_plan_history(
-        self, plan_id: uuid.UUID, *, limit: int = 100
-    ) -> list[PlanVersion]:
+    async def get_plan_goal_links(self, plan_id: uuid.UUID) -> list[PlanGoalLink]:
+        await self.get_plan(plan_id)
+        return list(
+            (
+                await self.session.execute(
+                    select(PlanGoalLink)
+                    .where(PlanGoalLink.plan_id == plan_id)
+                    .order_by(PlanGoalLink.role, PlanGoalLink.goal_id)
+                )
+            ).scalars()
+        )
+
+    async def get_version_basis(self, version_id: uuid.UUID) -> list[PlanVersionBasis]:
+        await self.get_version(version_id)
+        return list(
+            (
+                await self.session.execute(
+                    select(PlanVersionBasis)
+                    .where(PlanVersionBasis.plan_version_id == version_id)
+                    .order_by(PlanVersionBasis.role, PlanVersionBasis.entity_id)
+                )
+            ).scalars()
+        )
+
+    async def get_plan_history(self, plan_id: uuid.UUID, *, limit: int = 100) -> list[PlanVersion]:
         if not 1 <= limit <= 500:
             raise DomainValidationError("history limit must be between 1 and 500")
         await self.get_plan(plan_id)
@@ -210,6 +239,52 @@ class PlanningQueryService:
             )
             .scalars()
             .all()
+        )
+
+    async def get_rejected_versions(
+        self,
+        plan_id: uuid.UUID,
+        *,
+        duration_days: int | None = None,
+        limit: int = 100,
+    ) -> list[PlanVersion]:
+        """Return canonical rejected history, optionally filtered by stored duration content."""
+
+        rejected = [
+            version
+            for version in await self.get_plan_history(plan_id, limit=limit)
+            if version.status == PlanVersionStatus.REJECTED
+        ]
+        if duration_days is None:
+            return rejected
+        matched: list[PlanVersion] = []
+        for version in rejected:
+            items = await self.get_version_items(version.id)
+            content = "\n".join(
+                value
+                for value in (
+                    version.summary,
+                    version.rationale,
+                    version.proposed_strategy_snapshot,
+                    version.strategy_rationale_snapshot,
+                    *(item.title for item in items),
+                    *(item.description for item in items),
+                    *(item.expected_outcome for item in items),
+                )
+                if value
+            )
+            if self._content_mentions_duration(content, duration_days):
+                matched.append(version)
+        return matched
+
+    @staticmethod
+    def _content_mentions_duration(content: str, duration_days: int) -> bool:
+        normalized = content.casefold().replace("‑", "-").replace("–", "-").replace("—", "-")
+        return bool(
+            re.search(
+                rf"(?<!\d){duration_days}\s*(?:-\s*)?(?:днев\w*|дн(?:я|ей)?)\b",
+                normalized,
+            )
         )
 
     async def get_plan_snapshot(self, plan_id: uuid.UUID) -> dict[str, object]:
@@ -257,9 +332,8 @@ class PlanningQueryService:
             progress.plan_version_item_id: progress
             for progress in await self.get_item_progress(version_id)
         }
-        evidence = await self._source_evidence(
-            version.created_source_id, limit=max_evidence
-        )
+        evidence = await self._source_evidence(version.created_source_id, limit=max_evidence)
+        change_reason = self._change_reason(version, evidence)
         rejection_evidence: list[dict[str, object]] = []
         if version.status == PlanVersionStatus.REJECTED:
             events = (
@@ -305,9 +379,7 @@ class PlanningQueryService:
                         else None
                     ),
                     "progress_note": (
-                        progress_by_item[item.id].note
-                        if item.id in progress_by_item
-                        else None
+                        progress_by_item[item.id].note if item.id in progress_by_item else None
                     ),
                 }
                 for item in items
@@ -320,6 +392,7 @@ class PlanningQueryService:
                 for edge in dependencies
             ],
             "creation_evidence": evidence,
+            "change_reason": change_reason,
             "rejection_evidence": rejection_evidence[:max_evidence],
             "is_basis_stale": staleness.is_stale,
         }
@@ -334,6 +407,55 @@ class PlanningQueryService:
             await self.get_version_details(version.id, max_items=20, max_evidence=3)
             for version in versions
         ]
+
+    async def get_approval_activity(
+        self, plan_id: uuid.UUID, *, limit: int = 20
+    ) -> list[dict[str, object]]:
+        """Return chronological activation history without rewriting immutable versions."""
+
+        if not 1 <= limit <= 100:
+            raise DomainValidationError("approval activity limit must be between 1 and 100")
+        versions = {
+            version.id: version for version in await self.get_plan_history(plan_id, limit=500)
+        }
+        events = list(
+            (
+                await self.session.execute(
+                    select(Event)
+                    .where(
+                        Event.entity_id == plan_id,
+                        Event.event_type == EventType.PLAN_VERSION_APPROVED,
+                    )
+                    .order_by(Event.created_at, Event.id)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        result: list[dict[str, object]] = []
+        for event in events:
+            version_id = self._event_version_id(event.changes)
+            version = versions.get(version_id) if version_id is not None else None
+            if version is None:
+                continue
+            evidence = (
+                await self._source_evidence(event.source_id, limit=1)
+                if event.source_id is not None
+                else []
+            )
+            result.append(
+                {
+                    "version_number": version.version_number,
+                    "activated_at": event.created_at.isoformat(),
+                    "user_confirmation": evidence,
+                    "reactivated": any(
+                        change.get("field") == "reactivated" and change.get("new") is True
+                        for change in event.changes
+                    ),
+                }
+            )
+        return result
 
     async def compare_plan_versions(
         self, older_version_id: uuid.UUID, newer_version_id: uuid.UUID
@@ -373,6 +495,7 @@ class PlanningQueryService:
                 )
         old_dependencies = await self._dependency_labels(older.id, older_items)
         new_dependencies = await self._dependency_labels(newer.id, newer_items)
+        newer_evidence = await self._source_evidence(newer.created_source_id, limit=5)
         return {
             "strategy_changed": (
                 older.proposed_strategy_snapshot != newer.proposed_strategy_snapshot
@@ -390,6 +513,7 @@ class PlanningQueryService:
             "order_changes": order_changes,
             "dependencies_added": sorted(new_dependencies - old_dependencies),
             "dependencies_removed": sorted(old_dependencies - new_dependencies),
+            "newer_change_reason": self._change_reason(newer, newer_evidence),
         }
 
     async def get_staleness_details(self, version_id: uuid.UUID) -> dict[str, object]:
@@ -400,9 +524,7 @@ class PlanningQueryService:
             basis.entity_id: basis
             for basis in (
                 await self.session.execute(
-                    select(PlanVersionBasis).where(
-                        PlanVersionBasis.plan_version_id == version_id
-                    )
+                    select(PlanVersionBasis).where(PlanVersionBasis.plan_version_id == version_id)
                 )
             ).scalars()
         }
@@ -410,6 +532,15 @@ class PlanningQueryService:
         for changed in assessment.changed_basis:
             basis = basis_by_entity.get(changed.entity_id)
             if basis is None:
+                changed_basis.append(
+                    {
+                        "role": PlanVersionBasisRole.GOAL.value,
+                        "label": await self._basis_label(
+                            changed.entity_id,
+                            PlanVersionBasisRole.GOAL,
+                        ),
+                    }
+                )
                 continue
             changed_basis.append(
                 {
@@ -419,9 +550,7 @@ class PlanningQueryService:
             )
         return {"is_basis_stale": True, "changed_basis": changed_basis}
 
-    async def _basis_label(
-        self, entity_id: uuid.UUID, role: PlanVersionBasisRole
-    ) -> str | None:
+    async def _basis_label(self, entity_id: uuid.UUID, role: PlanVersionBasisRole) -> str | None:
         if role == PlanVersionBasisRole.GOAL:
             goal = await self.session.get(Goal, entity_id)
             return goal.title if goal is not None else None
@@ -482,9 +611,40 @@ class PlanningQueryService:
                 {
                     "text": message.text,
                     "occurred_at": message.sent_at.isoformat(),
+                    "author": message.author.value,
                 }
             )
         return result[:limit]
+
+    @staticmethod
+    def _change_reason(
+        version: PlanVersion, evidence: list[dict[str, object]]
+    ) -> dict[str, object]:
+        user_evidence = [
+            item for item in evidence if item.get("author") == MessageAuthor.USER.value
+        ]
+        return {
+            "user_trigger": {
+                "status": "RECORDED" if user_evidence else "NOT_RECORDED",
+                "evidence": user_evidence,
+            },
+            "assistant_rationale": {
+                "plan": version.rationale,
+                "strategy": version.strategy_rationale_snapshot,
+                "classification": "ASSISTANT_RATIONALE_NOT_USER_MOTIVE",
+            },
+        }
+
+    @staticmethod
+    def _event_version_id(changes: list[dict[str, object]]) -> uuid.UUID | None:
+        for item in changes:
+            if item.get("field") != "version_id" or item.get("new") is None:
+                continue
+            try:
+                return uuid.UUID(str(item["new"]))
+            except ValueError:
+                return None
+        return None
 
     async def get_strategy(self, plan_id: uuid.UUID) -> Strategy | None:
         plan = await self.get_plan(plan_id)
@@ -595,13 +755,16 @@ class PlanningQueryService:
     async def assess_plan_staleness(self, version_id: uuid.UUID) -> PlanStalenessAssessment:
         """Compare basis Events using the existing local `(created_at, id)` Event order."""
 
-        await self.get_version(version_id)
-        basis_rows = (
-            await self.session.execute(
-                select(PlanVersionBasis).where(PlanVersionBasis.plan_version_id == version_id)
-            )
-        ).scalars()
+        version = await self.get_version(version_id)
+        basis_rows = list(
+            (
+                await self.session.execute(
+                    select(PlanVersionBasis).where(PlanVersionBasis.plan_version_id == version_id)
+                )
+            ).scalars()
+        )
         changed: list[ChangedPlanBasis] = []
+        explicit_entities = {basis.entity_id for basis in basis_rows}
         for basis in basis_rows:
             recorded = await self.session.get(Event, basis.event_id)
             if recorded is None:
@@ -629,6 +792,48 @@ class PlanningQueryService:
                         entity_id=basis.entity_id,
                         recorded_event_id=basis.event_id,
                         latest_event_id=newer.id,
+                    )
+                )
+        linked_goals = list(
+            (
+                await self.session.execute(
+                    select(PlanGoalLink).where(PlanGoalLink.plan_id == version.plan_id)
+                )
+            ).scalars()
+        )
+        for link in linked_goals:
+            if link.goal_id in explicit_entities:
+                continue
+            baseline = (
+                await self.session.execute(
+                    select(Event)
+                    .where(
+                        Event.entity_id == link.goal_id,
+                        Event.created_at <= version.created_at,
+                    )
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            latest = (
+                await self.session.execute(
+                    select(Event)
+                    .where(Event.entity_id == link.goal_id)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            link_added_after_version = link.created_at > version.created_at
+            if latest is not None and (
+                link_added_after_version
+                or baseline is None
+                or (latest.created_at, latest.id) > (baseline.created_at, baseline.id)
+            ):
+                changed.append(
+                    ChangedPlanBasis(
+                        entity_id=link.goal_id,
+                        recorded_event_id=None if baseline is None else baseline.id,
+                        latest_event_id=latest.id,
                     )
                 )
         return PlanStalenessAssessment(

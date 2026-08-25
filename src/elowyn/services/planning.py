@@ -28,6 +28,7 @@ from elowyn.domain.enums import (
     EntityType,
     EventType,
     MessageAuthor,
+    PlanGoalRole,
     PlanItemProgressStatus,
     PlanVersionBasisRole,
     PlanVersionStatus,
@@ -35,11 +36,14 @@ from elowyn.domain.enums import (
 )
 from elowyn.domain.errors import DomainValidationError, EntityNotFoundError
 from elowyn.domain.planning_commands import (
+    HistoricalPlanVersionReactivate,
     PlanCandidateCreate,
     PlanCandidateReject,
     PlanCreate,
+    PlanGoalLinkCreate,
     PlanItemProgressUpdate,
     PlanVersionApprove,
+    PlanVersionBasisCreate,
     PlanVersionPresentationCreate,
 )
 from elowyn.services.domain_mutation import (
@@ -167,6 +171,57 @@ class PlanningService(DomainMutationService):
         return plan
 
     @atomic_domain_action
+    async def link_goal(
+        self,
+        plan_id: uuid.UUID,
+        command: PlanGoalLinkCreate,
+        ctx: ActionContext,
+    ) -> PlanGoalLink:
+        """Attach an explicitly stated canonical Goal basis to an existing Plan."""
+
+        plan = await self._plan(plan_id, for_update=True)
+        await self._active_typed_entity(command.goal_id, EntityType.GOAL)
+        if await self.session.get(Goal, command.goal_id) is None:
+            raise EntityNotFoundError(f"Goal {command.goal_id} was not found")
+        existing = await self.session.get(
+            PlanGoalLink,
+            {"plan_id": plan.entity_id, "goal_id": command.goal_id},
+        )
+        if existing is not None:
+            if existing.role != command.role:
+                raise DomainValidationError("existing Plan Goal link has a different role")
+            return existing
+        if command.role == PlanGoalRole.PRIMARY:
+            current_primary = (
+                await self.session.execute(
+                    select(PlanGoalLink).where(
+                        PlanGoalLink.plan_id == plan.entity_id,
+                        PlanGoalLink.role == command.role,
+                    )
+                )
+            ).scalar_one_or_none()
+            if current_primary is not None:
+                raise DomainValidationError("Plan already has a PRIMARY Goal")
+        source = await self._persisted_source(ctx.source)
+        operation = await self._operation(ctx)
+        link = PlanGoalLink(
+            plan_id=plan.entity_id,
+            goal_id=command.goal_id,
+            role=command.role,
+            source_id=source.id,
+        )
+        self.session.add(link)
+        await self._append_event(
+            operation=operation,
+            event_type=EventType.PLAN_GOAL_LINKED,
+            entity_id=plan.entity_id,
+            source=source,
+            changes=[change("goal_link", None, command.model_dump(mode="json"))],
+        )
+        await self.session.flush()
+        return link
+
+    @atomic_domain_action
     async def create_candidate_version(
         self, command: PlanCandidateCreate, ctx: ActionContext
     ) -> PlanVersion:
@@ -182,6 +237,38 @@ class PlanningService(DomainMutationService):
                 if await self.session.get(Task, item.linked_task_id) is None:
                     raise EntityNotFoundError(f"Task {item.linked_task_id} was not found")
 
+        effective_basis = list(command.basis)
+        explicit_goal_ids = {
+            basis.entity_id for basis in effective_basis if basis.role == PlanVersionBasisRole.GOAL
+        }
+        linked_goals = list(
+            (
+                await self.session.execute(
+                    select(PlanGoalLink).where(PlanGoalLink.plan_id == plan.entity_id)
+                )
+            ).scalars()
+        )
+        for link in linked_goals:
+            if link.goal_id in explicit_goal_ids:
+                continue
+            latest_event = (
+                await self.session.execute(
+                    select(Event)
+                    .where(Event.entity_id == link.goal_id)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if latest_event is None:
+                raise DomainValidationError("linked Goal has no canonical Event")
+            effective_basis.append(
+                PlanVersionBasisCreate(
+                    entity_id=link.goal_id,
+                    event_id=latest_event.id,
+                    role=PlanVersionBasisRole.GOAL,
+                )
+            )
+
         expected_types = {
             PlanVersionBasisRole.GOAL: EntityType.GOAL,
             PlanVersionBasisRole.TASK: EntityType.TASK,
@@ -189,15 +276,14 @@ class PlanningService(DomainMutationService):
             PlanVersionBasisRole.DECISION: EntityType.DECISION,
             PlanVersionBasisRole.STRATEGY: EntityType.STRATEGY,
         }
-        for basis in command.basis:
+        for basis in effective_basis:
             await self._active_typed_entity(basis.entity_id, expected_types[basis.role])
             event = await self.session.get(Event, basis.event_id)
             if event is None or event.entity_id != basis.entity_id:
                 raise DomainValidationError("basis Event must belong to the stated Entity")
 
         edges = [
-            (item.prerequisite_item_id, item.dependent_item_id)
-            for item in command.dependencies
+            (item.prerequisite_item_id, item.dependent_item_id) for item in command.dependencies
         ]
         self._assert_acyclic({item.id for item in command.items}, edges)
 
@@ -264,30 +350,30 @@ class PlanningService(DomainMutationService):
         )
         self.session.add(version)
         await self.session.flush()
+        persisted_items: dict[uuid.UUID, PlanVersionItem] = {}
         for item in command.items:
-            self.session.add(
-                PlanVersionItem(
-                    id=item.id,
-                    plan_version_id=version.id,
-                    ordinal=item.ordinal,
-                    title=item.title,
-                    description=item.description,
-                    expected_outcome=item.expected_outcome,
-                    deadline_at=item.deadline_at,
-                    estimated_duration_minutes=item.estimated_duration_minutes,
-                    linked_task_id=item.linked_task_id,
-                )
+            persisted = PlanVersionItem(
+                plan_version_id=version.id,
+                ordinal=item.ordinal,
+                title=item.title,
+                description=item.description,
+                expected_outcome=item.expected_outcome,
+                deadline_at=item.deadline_at,
+                estimated_duration_minutes=item.estimated_duration_minutes,
+                linked_task_id=item.linked_task_id,
             )
+            self.session.add(persisted)
+            persisted_items[item.id] = persisted
         await self.session.flush()
         for dependency in command.dependencies:
             self.session.add(
                 PlanVersionItemDependency(
                     plan_version_id=version.id,
-                    prerequisite_item_id=dependency.prerequisite_item_id,
-                    dependent_item_id=dependency.dependent_item_id,
+                    prerequisite_item_id=persisted_items[dependency.prerequisite_item_id].id,
+                    dependent_item_id=persisted_items[dependency.dependent_item_id].id,
                 )
             )
-        for basis in command.basis:
+        for basis in effective_basis:
             self.session.add(
                 PlanVersionBasis(
                     plan_version_id=version.id,
@@ -450,10 +536,7 @@ class PlanningService(DomainMutationService):
     ) -> PlanVersion:
         source, approval_message = await self._user_message_source(ctx)
         plan, version = await self._locked_version(command.plan_version_id)
-        if (
-            version.status == PlanVersionStatus.APPROVED
-            and version.approval_source_id == source.id
-        ):
+        if version.status == PlanVersionStatus.APPROVED and version.approval_source_id == source.id:
             return version
         if version.status != PlanVersionStatus.CANDIDATE:
             raise DomainValidationError("only the current Candidate can be approved")
@@ -528,6 +611,83 @@ class PlanningService(DomainMutationService):
             changes=[
                 change("version_status", "CANDIDATE", "APPROVED"),
                 change("version_id", None, version.id),
+            ],
+        )
+        await self.session.flush()
+        return version
+
+    @atomic_domain_action
+    async def reactivate_historical_plan_version(
+        self, command: HistoricalPlanVersionReactivate, ctx: ActionContext
+    ) -> PlanVersion:
+        source, confirmation_message = await self._user_message_source(ctx)
+        plan, version = await self._locked_version(command.plan_version_id)
+        if version.status == PlanVersionStatus.APPROVED:
+            return version
+        if (
+            version.status != PlanVersionStatus.SUPERSEDED
+            or version.approval_source_id is None
+            or version.approved_at is None
+        ):
+            raise DomainValidationError("only a formerly Approved version can be reactivated")
+        presented = (
+            await self.session.execute(
+                select(PlanVersionPresentation.id)
+                .join(Message, Message.id == PlanVersionPresentation.message_id)
+                .where(
+                    PlanVersionPresentation.plan_version_id == version.id,
+                    Message.author == MessageAuthor.ASSISTANT,
+                    Message.conversation_id == confirmation_message.conversation_id,
+                    PlanVersionPresentation.presented_at <= confirmation_message.sent_at,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if presented is None:
+            raise DomainValidationError(
+                "historical Approved version must be presented before reactivation"
+            )
+
+        operation = await self._operation(ctx)
+        approved_statement = select(PlanVersion).where(
+            PlanVersion.plan_id == plan.entity_id,
+            PlanVersion.status == PlanVersionStatus.APPROVED,
+            PlanVersion.id != version.id,
+        )
+        if self._uses_postgresql():
+            approved_statement = approved_statement.with_for_update().execution_options(
+                populate_existing=True
+            )
+        old_approved = (await self.session.execute(approved_statement)).scalar_one_or_none()
+        if old_approved is None:
+            raise DomainValidationError("Plan has no current Approved version to replace")
+        old_approved.status = PlanVersionStatus.SUPERSEDED
+        await self._append_event(
+            operation=operation,
+            event_type=EventType.PLAN_VERSION_SUPERSEDED,
+            entity_id=plan.entity_id,
+            source=source,
+            changes=[change("version_id", old_approved.id, version.id)],
+        )
+        version.status = PlanVersionStatus.APPROVED
+        reactivated_at = datetime.now(UTC)
+        await self.session.flush()
+        await self._accept_strategy(
+            plan=plan,
+            version=version,
+            source=source,
+            operation=operation,
+            accepted_at=reactivated_at,
+        )
+        await self._append_event(
+            operation=operation,
+            event_type=EventType.PLAN_VERSION_APPROVED,
+            entity_id=plan.entity_id,
+            source=source,
+            changes=[
+                change("version_status", "SUPERSEDED", "APPROVED"),
+                change("version_id", None, version.id),
+                change("reactivated", False, True),
             ],
         )
         await self.session.flush()
