@@ -1,8 +1,10 @@
 # Elowyn v0.2 — Long-term Memory implementation contract
 
-Status: **ARCHITECTURE CLOSED ENOUGH FOR CODE**
+Status: **IMPLEMENTED / ACCEPTANCE-HARDENED FOR v0.2.1**
 
-Source: master v0.6. If this spec conflicts with the master, master wins.
+Source: master v0.11 and the released v0.2/v0.2.1 implementation, migrations and acceptance
+evidence. For implemented behavior, working code and published releases take priority as defined
+by master section 2.2; unresolved product or architecture conflicts defer to the current master.
 
 ## 1. User capability
 

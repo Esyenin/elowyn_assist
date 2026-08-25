@@ -4,18 +4,19 @@ This file is intentionally compact. It is the stable operating contract for codi
 
 ## Authority order
 
-1. `docs/personal_ai_assistant_master_v0.6.docx` — authoritative project decisions and requirements.
-2. Active version spec in `docs/specs/` — compact implementation contract derived from the master.
-3. This `AGENTS.md` — stable coding/safety/workflow rules.
-4. Existing code/tests — implementation evidence, not architectural authority.
+1. Working code, migrations, tests and published releases — implemented reality.
+2. `docs/personal_ai_assistant_master_v0.11.docx` — accepted product decisions, canonical
+   architecture and roadmap.
+3. Active version spec in `docs/specs/` — compact implementation contract derived from the master.
+4. This `AGENTS.md` — stable coding/safety/workflow rules.
 
 If an active spec appears to conflict with the master, stop only for a real architectural/product conflict. Do not invent a new interpretation.
 
 ## Context discipline
 
-For ordinary v0.2 work:
+For ordinary versioned work:
 1. read this file;
-2. read `docs/specs/MEMORY_V0_2.md`;
+2. read the relevant active contract in `docs/specs/`;
 3. use `docs/ARCHITECTURE_INDEX.md` to open only relevant master sections;
 4. inspect only relevant code/tests;
 5. broaden scope only when evidence requires it.
