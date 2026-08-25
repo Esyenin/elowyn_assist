@@ -21,8 +21,10 @@ venv/
 .coverage.*
 htmlcov/
 
-# Build artifacts
-build/
+# Build artifacts (keep the reviewed personal launcher only)
+build/*
+!build/start_elowyn_personal.py
+!build/start_elowyn_personal.cmd
 dist/
 *.egg-info/
 

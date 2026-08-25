@@ -5,7 +5,11 @@ All DB-backed tools are sequential because they share one SQLAlchemy AsyncSessio
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from elowyn.assistant.deep_memory_tools import deep_memory_policy, register_deep_memory_tools
+from elowyn.assistant.planning_presentation import PlanningTurnState
+from elowyn.assistant.planning_tools import planning_policy, register_planning_tools
 from elowyn.domain.commands import (
     DecisionCreate,
     DecisionRevoke,
@@ -29,6 +33,8 @@ from elowyn.domain.commands import (
 )
 from elowyn.memory.deep import DeepMemoryRoute
 from elowyn.services.deep_memory import DeepMemoryService
+from elowyn.services.planning import PlanningService
+from elowyn.services.planning_query import PlanningQueryService
 from elowyn.services.query import WorldStateQueryService
 from elowyn.services.world_state import (
     ActionContext,
@@ -44,6 +50,11 @@ def build_agent(
     action_context: ActionContext,
     deep_memory_service: DeepMemoryService | None = None,
     deep_memory_route: DeepMemoryRoute = DeepMemoryRoute.NONE,
+    planning_service: PlanningService | None = None,
+    planning_query_service: PlanningQueryService | None = None,
+    planning_turn_state: PlanningTurnState | None = None,
+    conversation_id: UUID | None = None,
+    user_message_id: UUID | None = None,
 ):
     from pydantic_ai import Agent
 
@@ -52,6 +63,12 @@ def build_agent(
     system_prompt = load_identity_prompt()
     if deep_memory_service is not None and deep_memory_route != DeepMemoryRoute.NONE:
         system_prompt += deep_memory_policy(deep_memory_route)
+    elif (
+        planning_service is not None
+        and planning_query_service is not None
+        and planning_turn_state is not None
+    ):
+        system_prompt += planning_policy()
     agent = Agent(model=model, system_prompt=system_prompt)
 
     @agent.tool_plain(sequential=True)
@@ -64,6 +81,23 @@ def build_agent(
         # also requests a state change, it can be handled as a separate normal turn.
         register_deep_memory_tools(agent, deep_memory_service, deep_memory_route)
         return agent
+
+    if (
+        planning_service is not None
+        and planning_query_service is not None
+        and planning_turn_state is not None
+        and conversation_id is not None
+        and user_message_id is not None
+    ):
+        register_planning_tools(
+            agent,
+            service=planning_service,
+            query_service=planning_query_service,
+            action_context=action_context,
+            turn_state=planning_turn_state,
+            conversation_id=conversation_id,
+            user_message_id=user_message_id,
+        )
 
     @agent.tool_plain(sequential=True)
     async def create_task(command: TaskCreate) -> dict[str, str]:

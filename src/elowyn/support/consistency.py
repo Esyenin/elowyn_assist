@@ -14,10 +14,19 @@ from elowyn.db.models import (
     Goal,
     Message,
     Operation,
+    Plan,
+    PlanGoalLink,
+    PlanItemProgress,
+    PlanVersion,
+    PlanVersionBasis,
+    PlanVersionItem,
+    PlanVersionItemDependency,
+    PlanVersionPresentation,
     Project,
     ProjectGoalLink,
     Source,
     SourceDependency,
+    Strategy,
     SuccessCriterion,
     Task,
     TaskDependency,
@@ -27,6 +36,7 @@ from elowyn.domain.enums import (
     DecisionStatus,
     EntityType,
     MessageAuthor,
+    PlanVersionStatus,
     RelationType,
     SourceType,
     SuccessCriterionStatus,
@@ -86,11 +96,20 @@ class ConsistencyVerifier:
             item.entity_id: item
             for item in (await self.session.execute(select(Decision))).scalars()
         }
+        plans = {
+            item.entity_id: item for item in (await self.session.execute(select(Plan))).scalars()
+        }
+        strategies = {
+            item.entity_id: item
+            for item in (await self.session.execute(select(Strategy))).scalars()
+        }
         typed: dict[EntityType, Mapping[UUID, object]] = {
             EntityType.TASK: tasks,
             EntityType.PROJECT: projects,
             EntityType.GOAL: goals,
             EntityType.DECISION: decisions,
+            EntityType.PLAN: plans,
+            EntityType.STRATEGY: strategies,
         }
         for entity in entities.values():
             expected = typed[entity.entity_type]
@@ -118,11 +137,237 @@ class ConsistencyVerifier:
 
         await self._verify_history_and_provenance(entities, goals)
         await self._verify_relations(entities, tasks, projects, goals)
+        await self._verify_planning(entities)
         self._verify_supersede_chains(entities, decisions)
         self._verify_parent_cycles(tasks, "parent_task_id", "TASK_PARENT_CYCLE")
         self._verify_parent_cycles(projects, "parent_project_id", "PROJECT_PARENT_CYCLE")
         self._verify_parent_cycles(goals, "parent_goal_id", "GOAL_PARENT_CYCLE")
         return ConsistencyReport(tuple(sorted(set(self._issues))))
+
+    async def _verify_planning(self, entities: dict[UUID, Entity]) -> None:
+        plans = {
+            item.entity_id: item for item in (await self.session.execute(select(Plan))).scalars()
+        }
+        strategies = {
+            item.entity_id: item
+            for item in (await self.session.execute(select(Strategy))).scalars()
+        }
+        versions = {
+            item.id: item for item in (await self.session.execute(select(PlanVersion))).scalars()
+        }
+        items = {
+            item.id: item
+            for item in (await self.session.execute(select(PlanVersionItem))).scalars()
+        }
+        messages = {
+            item.id: item for item in (await self.session.execute(select(Message))).scalars()
+        }
+        events = {item.id: item for item in (await self.session.execute(select(Event))).scalars()}
+        sources = {
+            item.id: item for item in (await self.session.execute(select(Source))).scalars()
+        }
+
+        versions_by_plan: dict[UUID, list[PlanVersion]] = {}
+        for version in versions.values():
+            versions_by_plan.setdefault(version.plan_id, []).append(version)
+        for plan_id, plan_versions in versions_by_plan.items():
+            for status in (PlanVersionStatus.CANDIDATE, PlanVersionStatus.APPROVED):
+                if sum(version.status == status for version in plan_versions) > 1:
+                    self.issue(
+                        "PLAN_CURRENT_VERSION_CARDINALITY",
+                        plan_id,
+                        f"more than one current {status.value} version",
+                    )
+
+        for plan in plans.values():
+            if plan.strategy_id is not None and plan.strategy_id not in strategies:
+                self.issue("PLAN_STRATEGY_MISSING", plan.entity_id, "strategy does not exist")
+        for strategy in strategies.values():
+            accepted = versions.get(strategy.accepted_from_plan_version_id)
+            if accepted is None:
+                self.issue(
+                    "STRATEGY_ACCEPTED_VERSION_MISSING",
+                    strategy.entity_id,
+                    "accepted PlanVersion does not exist",
+                )
+            else:
+                accepted_plan = plans.get(accepted.plan_id)
+                if accepted_plan is None or accepted_plan.strategy_id != strategy.entity_id:
+                    self.issue(
+                        "STRATEGY_PLAN_MISMATCH",
+                        strategy.entity_id,
+                        "accepted PlanVersion Plan does not reference this Strategy",
+                    )
+
+        for version in versions.values():
+            if version.plan_id not in plans:
+                self.issue("PLAN_VERSION_PLAN_MISSING", version.id, "Plan does not exist")
+            if version.based_on_version_id is not None:
+                basis_version = versions.get(version.based_on_version_id)
+                if basis_version is None or basis_version.plan_id != version.plan_id:
+                    self.issue(
+                        "PLAN_VERSION_LINEAGE_INVALID",
+                        version.id,
+                        "based-on version is missing or belongs to another Plan",
+                    )
+        for item in items.values():
+            if item.plan_version_id not in versions:
+                self.issue("PLAN_ITEM_VERSION_MISSING", item.id, "PlanVersion does not exist")
+
+        dependencies = (
+            await self.session.execute(select(PlanVersionItemDependency))
+        ).scalars().all()
+        for dependency in dependencies:
+            prerequisite = items.get(dependency.prerequisite_item_id)
+            dependent = items.get(dependency.dependent_item_id)
+            if (
+                prerequisite is None
+                or dependent is None
+                or prerequisite.plan_version_id != dependency.plan_version_id
+                or dependent.plan_version_id != dependency.plan_version_id
+            ):
+                self.issue(
+                    "PLAN_ITEM_DEPENDENCY_VERSION_MISMATCH",
+                    f"{dependency.prerequisite_item_id}:{dependency.dependent_item_id}",
+                    "dependency items do not belong to its PlanVersion",
+                )
+
+        presentations = (
+            await self.session.execute(select(PlanVersionPresentation))
+        ).scalars().all()
+        presented_version_ids = {presentation.plan_version_id for presentation in presentations}
+        for presentation in presentations:
+            message = messages.get(presentation.message_id)
+            if presentation.plan_version_id not in versions:
+                self.issue(
+                    "PLAN_PRESENTATION_VERSION_MISSING",
+                    presentation.id,
+                    "PlanVersion does not exist",
+                )
+            if message is None or message.author != MessageAuthor.ASSISTANT:
+                self.issue(
+                    "PLAN_PRESENTATION_MESSAGE_INVALID",
+                    presentation.id,
+                    "presentation must resolve to an assistant Message",
+                )
+
+        for version in versions.values():
+            if version.status != PlanVersionStatus.APPROVED:
+                continue
+            approval_source = (
+                sources.get(version.approval_source_id)
+                if version.approval_source_id is not None
+                else None
+            )
+            approval_message = (
+                messages.get(approval_source.message_id)
+                if approval_source is not None and approval_source.message_id is not None
+                else None
+            )
+            if (
+                approval_source is None
+                or approval_source.source_type != SourceType.USER_MESSAGE
+                or approval_message is None
+                or approval_message.author != MessageAuthor.USER
+            ):
+                self.issue(
+                    "PLAN_APPROVAL_SOURCE_INVALID",
+                    version.id,
+                    "Approved PlanVersion must resolve to a user Message Source",
+                )
+            if version.id not in presented_version_ids:
+                self.issue(
+                    "PLAN_APPROVED_WITHOUT_PRESENTATION",
+                    version.id,
+                    "Approved PlanVersion has no recorded Presentation",
+                )
+
+        expected_role_type = {
+            "GOAL": EntityType.GOAL,
+            "TASK": EntityType.TASK,
+            "PROJECT": EntityType.PROJECT,
+            "DECISION": EntityType.DECISION,
+            "STRATEGY": EntityType.STRATEGY,
+        }
+        basis_rows = (await self.session.execute(select(PlanVersionBasis))).scalars().all()
+        for basis in basis_rows:
+            entity = entities.get(basis.entity_id)
+            event = events.get(basis.event_id)
+            if basis.plan_version_id not in versions:
+                self.issue("PLAN_BASIS_VERSION_MISSING", basis.event_id, "PlanVersion is missing")
+            if entity is None or event is None or event.entity_id != basis.entity_id:
+                self.issue(
+                    "PLAN_BASIS_EVENT_MISMATCH",
+                    basis.event_id,
+                    "basis Event does not resolve to the stated Entity",
+                )
+            elif entity.entity_type != expected_role_type[basis.role.value]:
+                self.issue(
+                    "PLAN_BASIS_ROLE_MISMATCH",
+                    basis.event_id,
+                    "basis role does not match Entity type",
+                )
+
+        links = (await self.session.execute(select(PlanGoalLink))).scalars().all()
+        for link in links:
+            if link.plan_id not in plans or link.goal_id not in {
+                entity_id
+                for entity_id, entity in entities.items()
+                if entity.entity_type == EntityType.GOAL
+            }:
+                self.issue(
+                    "PLAN_GOAL_LINK_INVALID",
+                    f"{link.plan_id}:{link.goal_id}",
+                    "typed Plan or Goal endpoint is missing",
+                )
+
+        progress_rows = (await self.session.execute(select(PlanItemProgress))).scalars().all()
+        for progress in progress_rows:
+            progress_item = items.get(progress.plan_version_item_id)
+            progress_version = (
+                versions.get(progress_item.plan_version_id)
+                if progress_item is not None
+                else None
+            )
+            if progress_version is None or progress_version.approval_source_id is None:
+                self.issue(
+                    "PLAN_PROGRESS_WITHOUT_APPROVAL",
+                    progress.plan_version_item_id,
+                    "progress belongs to an item that has never been Approved",
+                )
+
+        dependencies_by_version: dict[UUID, list[PlanVersionItemDependency]] = {}
+        for dependency in dependencies:
+            dependencies_by_version.setdefault(dependency.plan_version_id, []).append(dependency)
+        for version_id, version_dependencies in dependencies_by_version.items():
+            nodes = {
+                item.id for item in items.values() if item.plan_version_id == version_id
+            }
+            outgoing: dict[UUID, set[UUID]] = {node: set() for node in nodes}
+            indegree = dict.fromkeys(nodes, 0)
+            for dependency in version_dependencies:
+                if (
+                    dependency.prerequisite_item_id not in nodes
+                    or dependency.dependent_item_id not in nodes
+                ):
+                    continue
+                outgoing[dependency.prerequisite_item_id].add(dependency.dependent_item_id)
+                indegree[dependency.dependent_item_id] += 1
+            frontier = [node for node, count in indegree.items() if count == 0]
+            visited = 0
+            while frontier:
+                current = frontier.pop()
+                visited += 1
+                for dependent_id in outgoing[current]:
+                    indegree[dependent_id] -= 1
+                    if indegree[dependent_id] == 0:
+                        frontier.append(dependent_id)
+            if visited != len(nodes):
+                self.issue(
+                    "PLAN_ITEM_DEPENDENCY_CYCLE",
+                    version_id,
+                    "PlanVersion item dependencies contain a cycle",
+                )
 
     async def _verify_history_and_provenance(
         self, entities: dict[UUID, Entity], goals: dict[UUID, Goal]
